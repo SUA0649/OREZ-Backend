@@ -9,7 +9,7 @@ appdb#= \dt --Write this command in the psql cmd and then you'll see the table o
 */
 
 -- Ignore errors they are wrong errors
-CREATE TABLE IF NOT EXISTS users(
+CREATE TABLE IF NOT EXISTS users( --OWNERS
     user_id serial primary key,
     user_name varchar(30) not null unique,
     password_hash varchar(255) not null,
@@ -23,6 +23,12 @@ CREATE TABLE IF NOT EXISTS REPOSITORY(
     owner_id int references users(user_id) not null,
     created_at TIMESTAMP default CURRENT_TIMESTAMP
 ); 
+
+CREATE TABLE IF NOT EXISTS RepoPermission( -- A relation to address repo-permission
+    user_id int references users(user_id) not null ,
+    repo_id int references REPOSITORY(repo_id) not null,
+    permission varchar(20) not null    check (permission in ('Owner','Viewer','Contributor'))
+);
 
 CREATE TABLE IF NOT EXISTS Blob ( -- This is a pointer to each individual file.
     blob_id serial primary key,
@@ -56,9 +62,9 @@ CREATE TABLE IF NOT EXISTS Commit(
     created_at TIMESTAMP default CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS Commit_Parent(
+CREATE TABLE IF NOT EXISTS Commit_Parent( -- To Track the commits.
     parent_id serial primary key,
     commit_id int references Commit(commit_id) not null,
-    parent_commit int references Commit(commit_id) --  What would happen for the root table, will the parent be the main commit?
+    parent_commit int references Commit(commit_id)
 );
 
