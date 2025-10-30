@@ -8,7 +8,6 @@ docker exec -it {container_name} psql -U {user_name} -d {DB_name}
 appdb#= \dt --Write this command in the psql cmd and then you'll see the table over there.  
 */
 
--- Ignore errors they are wrong errors
 CREATE TABLE IF NOT EXISTS users( --OWNERS
     user_id serial primary key,
     user_name varchar(30) not null unique,

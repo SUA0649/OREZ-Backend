@@ -11,6 +11,6 @@ services:
       - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
-
+      - ./blobs:/blobs
 volumes:
   pg_data:
