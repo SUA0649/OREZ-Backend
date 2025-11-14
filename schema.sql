@@ -8,6 +8,7 @@ docker exec -it {container_name} psql -U {user_name} -d {DB_name}
 appdb#= \dt --Write this command in the psql cmd and then you'll see the table over there.  
 */
 
+
 CREATE TABLE IF NOT EXISTS users( --OWNERS
     user_id serial primary key,
     user_name varchar(30) not null unique,
@@ -23,10 +24,11 @@ CREATE TABLE IF NOT EXISTS REPOSITORY(
     created_at TIMESTAMP default CURRENT_TIMESTAMP
 ); 
 
-CREATE TABLE IF NOT EXISTS RepoPermission( -- A relation to address repo-permission
-    user_id int references users(user_id) not null ,
+CREATE TABLE IF NOT EXISTS RepoPermission(
+    user_id int references users(user_id) not null,
     repo_id int references REPOSITORY(repo_id) not null,
-    permission varchar(20) not null    check (permission in ('Owner','Viewer','Contributor'))
+    permission varchar(20) not null check (permission in ('Owner','Viewer','Contributor')),
+    UNIQUE(user_id, repo_id)
 );
 
 CREATE TABLE IF NOT EXISTS Blob ( -- This is a pointer to each individual file.
