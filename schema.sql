@@ -45,14 +45,17 @@ CREATE TABLE IF NOT EXISTS Tree(  -- This is similar to how a folder works, a tr
     created_at TIMESTAMP default CURRENT_TIMESTAMP
 ); 
 
-CREATE TABLE IF NOT EXISTS tree_entry ( -- This table is used to link the tree and the blobs together.
-    entry_id SERIAL PRIMARY KEY,
-    tree_id INT NOT NULL REFERENCES tree(tree_id),
-    name VARCHAR(100) NOT NULL,
-    mode VARCHAR(10) NOT NULL CHECK (mode IN ('blob', 'tree')),
-    blob_id INT REFERENCES blob(blob_id), --This could be null, consider an empty folder.
-    child_tree_id INT REFERENCES tree(tree_id), -- This is something like addressing sub-folders
-    UNIQUE(tree_id, name)
+CREATE TABLE IF NOT EXISTS Tree_Entry( -- This table is used to link the tree and the blobs together.
+    entry_id serial primary key,
+    tree_id int references Tree(tree_id) not null, 
+    
+    name VARCHAR(255) NOT NULL, 
+    mode VARCHAR(10) NOT NULL,  
+    
+    blob_id int references Blob(blob_id), 
+    child_tree_id int references Tree(tree_id), 
+    
+    UNIQUE(tree_id, name) 
 );
 
 
