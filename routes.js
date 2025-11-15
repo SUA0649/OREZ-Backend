@@ -491,6 +491,78 @@ router.get('/repos/:repoId/files', async (req, res) => {
   }
 });
 
+// GET ALL FILES FOR A SPECIFIC TREE
+router.get('/repos/:repoId/tree/:treeId', async (req, res) => {
+  const { treeId } = req.params;
+
+  try {
+    const { rows: entries } = await pool.query(
+      `WITH RECURSIVE file_tree AS (
+         SELECT tree_id, name, mode, child_tree_id, blob_id
+         FROM tree_entry
+         WHERE tree_id = $1
+
+         UNION ALL
+
+         SELECT te.tree_id, te.name, te.mode, te.child_tree_id, te.blob_id
+         FROM tree_entry te
+         INNER JOIN file_tree ft ON te.tree_id = ft.child_tree_id
+       )
+       SELECT 
+         ft.tree_id, ft.name, ft.mode, ft.child_tree_id, ft.blob_id, 
+         b.hash AS blob_hash, b.size AS blob_size
+       FROM file_tree ft
+       LEFT JOIN blob b ON ft.blob_id = b.blob_id;`,
+      [treeId]
+    );
+
+    const formatted = entries.map(e => ({
+      tree_id: e.tree_id,
+      name: e.name,
+      mode: e.mode,
+      child_tree_id: e.child_tree_id,
+      blob: e.mode === 'blob' ? { blob_id: e.blob_id, hash: e.blob_hash, size: e.blob_size } : null
+    }));
+
+    res.json({ root_tree_id: treeId, entries: formatted });
+
+  } catch (err) {
+    console.error('GET /tree error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/repos/:repoId/blob/:hash', async (req, res) => {
+  const { repoId, hash } = req.params;
+
+  try {
+    // Find the blob in the database to get its path
+    const { rows: [blob] } = await pool.query(
+      `SELECT content_path FROM blob WHERE hash = $1`,
+      [hash]
+    );
+
+    if (!blob) {
+      return res.status(404).json({ error: 'Blob not found' });
+    }
+
+    // 2. Read the file from disk
+    const storageDir = path.resolve(__dirname, 'repo_storage');
+    const safePath = path.resolve(blob.content_path);
+
+    if (!safePath.startsWith(storageDir)) {
+       return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    // 3. Send the file content
+    res.sendFile(safePath);
+
+  } catch (err) {
+    console.error('GET /blob error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get('/repos/:repoId/commits', async (req, res) => {
   const { repoId } = req.params;
 
@@ -498,6 +570,7 @@ router.get('/repos/:repoId/commits', async (req, res) => {
     const { rows: commits } = await pool.query(
       `SELECT
          c.commit_id,
+         c.tree_id,
          c.message,
          c.created_at,
          u.user_name
