@@ -181,7 +181,7 @@ router.post('/repos/:repoId/collaborators', async (req, res) => {
 async function storeBlobFile(repoId, hash, buffer) {
   const folder = hash.substring(0, 2);
   const rest = hash.substring(2);
-  const storageDir = path.join(__dirname, 'repo_storage', String(repoId), 'objects', folder);
+  const storageDir = path.join(__dirname, 'blobs', String(repoId), 'objects', folder);
   await fs.ensureDir(storageDir);
   const finalPath = path.join(storageDir, rest);
   if (!await fs.pathExists(finalPath)) await fs.writeFile(finalPath, buffer);
@@ -547,11 +547,18 @@ router.get('/repos/:repoId/blob/:hash', async (req, res) => {
     }
 
     // 2. Read the file from disk
-    const storageDir = path.resolve(__dirname, 'repo_storage');
+    const storageDir = path.resolve(__dirname, 'blobs');
     const safePath = path.resolve(blob.content_path);
 
+    console.log('--- DEBUG BLOB FETCH ---');
+    console.log('1. Expected Base Dir:', storageDir);
+    console.log('2. Database Stored Path:', blob.content_path);
+    console.log('3. Resolved Safe Path:', safePath);
+    console.log('4. Match Check:', safePath.startsWith(storageDir));
+
     if (!safePath.startsWith(storageDir)) {
-       return res.status(403).json({ error: 'Forbidden' });
+      console.log('❌ BLOCKING REQUEST: Path mismatch');
+      return res.status(403).json({ error: 'Forbidden' });
     }
 
     // 3. Send the file content
@@ -562,6 +569,7 @@ router.get('/repos/:repoId/blob/:hash', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 router.get('/repos/:repoId/commits', async (req, res) => {
   const { repoId } = req.params;
