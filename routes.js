@@ -35,16 +35,23 @@ router.post('/signup', async(req, res) =>{
     //Just hashing the password
     const passwordHash = crypto.createHash('sha256').update(password).digest('hex');
     //now insert
+    const client = await pool.connect();
     try {
-        const { rows: [user] } = await pool.query(
+        await client.query('BEGIN');
+
+        const { rows: [user] } = await client.query(
             //$1 = username, $2 = passwordHash
       'INSERT INTO users (user_name, password_hash) VALUES ($1, $2) RETURNING user_id, user_name, created_at',
       [user_name, passwordHash]
     );
+        await client.query('COMMIT');
         res.json(user);
     } catch (err) {
+        await client.query('ROLLBACK');
         //If error send http 400 error code with an error message
         res.status(400).json({ error: err.message });
+    } finally {
+        client.release();
     }
 
 });
@@ -118,34 +125,22 @@ router.get('/repos/:repoId/collaborators', async (req, res) => {
 });
 
 //Now to create a new repository
-
 router.post('/repos/create', async (req, res) => {
-  const { owner_id, name, description } = req.body;
-  try {
-    const { rows: [repo] } = await pool.query(
-      `INSERT INTO repository (name, description, owner_id) VALUES ($1, $2, $3) RETURNING repo_id`,
-      [name, description, owner_id]
-    );
+  const { owner_id, name, description } = req.body;
+  try {
+    // Call the new stored function
+    const { rows: [repo] } = await pool.query(
+      `SELECT create_new_repository($1, $2, $3) as repo_id`,
+      [name, description, owner_id]
+    );
+    
+    // The function handles the repo, permission, and initial tree creation atomically
+    res.json({ repo_id: repo.repo_id }); // Return the newly created ID
 
-    // Add owner permission
-    await pool.query(
-      `INSERT INTO repopermission (user_id, repo_id, permission) VALUES ($1, $2, $3)`,
-      [owner_id, repo.repo_id, 'Owner']
-    );
-    
-    // --- Insert root tree for the new repo ---
-    const { rows: [rootTree] } = await pool.query(
-      `INSERT INTO tree (hash, repo_id) VALUES ($1, $2) RETURNING tree_id`,
-      [crypto.randomBytes(20).toString('hex'), repo.repo_id]
-    );
-
-    res.json({ ...repo, root_tree_id: rootTree.tree_id });
-
-   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
-
 
 // Add collaborator 
 router.post('/repos/:repoId/collaborators', async (req, res) => {
@@ -154,24 +149,36 @@ router.post('/repos/:repoId/collaborators', async (req, res) => {
 
   if (!user_name || !permission) return res.status(400).json({ error: 'Missing fields' });
 
+  const client = await pool.connect();
   try {
-    const { rows: [user] } = await pool.query(
+    await client.query('BEGIN');
+    
+    const { rows: [user] } = await client.query(
       'SELECT user_id FROM users WHERE user_name = $1', [user_name]
     );
-
-    if (!user) return res.status(404).json({ error: 'User not found' });
+    
+    if (!user) {
+      await client.query('ROLLBACK'); // Rollback before returning an error
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
     // If user exists, add or update permission
-    await pool.query(
+    await client.query(
       `INSERT INTO repopermission (user_id, repo_id, permission)
        VALUES ($1, $2, $3)
        ON CONFLICT (user_id, repo_id) DO UPDATE SET permission = EXCLUDED.permission`,
       [user.user_id, repoId, permission]
     );
 
+    await client.query('COMMIT');
+
     res.json({ success: true });
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error(err);
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -285,7 +292,8 @@ async function processUploadedFilesAsFolder(repoId, files) {
   } finally {
     client.release();
   }
-}router.post('/repos/:repoId/upload-folder', upload.array('files'), async (req, res) => {
+}
+router.post('/repos/:repoId/upload-folder', upload.array('files'), async (req, res) => {
   const { repoId } = req.params;
   const files = req.files;
   
@@ -310,6 +318,7 @@ async function processUploadedFilesAsFolder(repoId, files) {
   const client = await pool.connect();
 
   try {
+    //Start transaction
     await client.query('BEGIN');
 
     // --- REMOVED: We no longer look for the *existing* root tree ---

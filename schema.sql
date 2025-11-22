@@ -75,3 +75,93 @@ CREATE TABLE IF NOT EXISTS Commit_Parent( -- To Track the commits.
     parent_commit int references Commit(commit_id)
 );
 
+
+-- Function to create a new repository, its owner permission, and its initial root tree
+CREATE OR REPLACE FUNCTION create_new_repository(
+    repo_name VARCHAR(50),
+    repo_description VARCHAR(100),
+    owner_id_in INT
+)
+RETURNS INT AS $$
+DECLARE
+    new_repo_id INT;
+    root_tree_id INT;
+BEGIN
+    -- 1. Create the Repository
+    INSERT INTO REPOSITORY (name, description, owner_id)
+    VALUES (repo_name, repo_description, owner_id_in)
+    RETURNING repo_id INTO new_repo_id;
+
+    -- 2. Add Owner Permission
+    --Handled by trigger now
+--    INSERT INTO RepoPermission (user_id, repo_id, permission)
+--    VALUES (owner_id_in, new_repo_id, 'Owner');
+
+    -- 3. Create initial Root Tree (using a placeholder hash for now)
+    INSERT INTO Tree (hash, repo_id)
+    VALUES (md5(random()::text), new_repo_id) -- Using md5(random()::text) for a quick unique hash
+    RETURNING tree_id INTO root_tree_id;
+
+    -- Return the ID of the new repository
+    RETURN new_repo_id;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- Function: Automatically grants 'Owner' permission upon repository creation.
+CREATE OR REPLACE FUNCTION grant_owner_permission()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Insert the owner into RepoPermission with 'Owner' role.
+    -- The new repository's details are in the 'NEW' record.
+    INSERT INTO RepoPermission (user_id, repo_id, permission)
+    VALUES (NEW.owner_id, NEW.repo_id, 'Owner')
+    ON CONFLICT (user_id, repo_id) DO NOTHING; -- Prevents errors if permission is somehow already set
+    
+    RETURN NEW; -- Return the row being inserted into REPOSITORY
+END;
+$$ LANGUAGE plpgsql;
+
+-- Trigger: Fires AFTER a row is inserted into REPOSITORY
+CREATE TRIGGER tr_grant_owner_permission
+AFTER INSERT ON REPOSITORY
+FOR EACH ROW
+EXECUTE FUNCTION grant_owner_permission();
+
+
+
+-- Function: Deletes all associated permissions when a repository is deleted.
+CREATE OR REPLACE FUNCTION delete_repo_permissions()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Delete permissions associated with the deleted repository.
+    -- The deleted repository's details are in the 'OLD' record.
+    DELETE FROM RepoPermission WHERE repo_id = OLD.repo_id;
+    
+    RETURN OLD; -- Return the deleted row
+END;
+$$ LANGUAGE plpgsql;
+
+-- Trigger: Fires BEFORE a row is deleted from REPOSITORY
+CREATE TRIGGER tr_delete_repo_permissions
+BEFORE DELETE ON REPOSITORY
+FOR EACH ROW
+EXECUTE FUNCTION delete_repo_permissions();
+
+
+-- Function: Updates the timestamp when a RepoPermission record is modified.
+CREATE OR REPLACE FUNCTION update_permission_timestamp()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Set the created_at to the current timestamp
+    NEW.created_at = CURRENT_TIMESTAMP;
+    
+    RETURN NEW; -- Return the row being updated
+END;
+$$ LANGUAGE plpgsql;
+
+-- Trigger: Fires BEFORE an UPDATE on RepoPermission
+CREATE TRIGGER tr_update_permission_timestamp
+BEFORE UPDATE ON RepoPermission
+FOR EACH ROW
+EXECUTE FUNCTION update_permission_timestamp();
