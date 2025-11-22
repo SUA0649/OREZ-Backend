@@ -23,16 +23,17 @@ CREATE TABLE IF NOT EXISTS REPOSITORY(
     created_at TIMESTAMP default CURRENT_TIMESTAMP
 ); 
 
-CREATE TABLE IF NOT EXISTS RepoPermission( -- A relation to address repo-permission
-    user_id int references users(user_id) not null ,
+CREATE TABLE IF NOT EXISTS RepoPermission(
+    user_id int references users(user_id) not null,
     repo_id int references REPOSITORY(repo_id) not null,
-    permission varchar(20) not null    check (permission in ('Owner','Viewer','Contributor'))
+    permission varchar(20) not null check (permission in ('Owner','Viewer','Contributor')),
+    UNIQUE(user_id, repo_id)
 );
 
 CREATE TABLE IF NOT EXISTS Blob ( -- This is a pointer to each individual file.
     blob_id serial primary key,
     hash varchar(100) not null unique,
-    content_path varchar(70) not null unique,
+    content_path varchar(200) not null unique,
     size int not null, -- Not sure why I need this will explore later.
     created_at TIMESTAMP default CURRENT_TIMESTAMP
 );
@@ -47,9 +48,16 @@ CREATE TABLE IF NOT EXISTS Tree(  -- This is similar to how a folder works, a tr
 CREATE TABLE IF NOT EXISTS Tree_Entry( -- This table is used to link the tree and the blobs together.
     entry_id serial primary key,
     tree_id int references Tree(tree_id) not null, 
-    blob_id int references Blob(blob_id), --This could be null, consider an empty folder.
-    child_tree_id int references Tree(tree_id) -- This is something like addressing sub-folders
+    
+    name VARCHAR(255) NOT NULL, 
+    mode VARCHAR(10) NOT NULL,  
+    
+    blob_id int references Blob(blob_id), 
+    child_tree_id int references Tree(tree_id), 
+    
+    UNIQUE(tree_id, name) 
 );
+
 
 CREATE TABLE IF NOT EXISTS Commit(
     commit_id serial primary key,

@@ -1,7 +1,19 @@
 {
+  "name": "orez-backend",
+  "version": "1.0.0",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
   "dependencies": {
-    "crypto": "^1.0.1",
+    "adm-zip": "^0.5.16",
+    "archiver": "^7.0.1",
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
     "fs": "^0.0.1-security",
+    "fs-extra": "^11.3.2",
+    "multer": "^2.0.2",
     "pg": "^8.16.3"
   }
 }
