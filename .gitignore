@@ -1,1 +1,5 @@
 node_modules/
+repo_storage/
+Upload-Download-Module
+blobs/
+docker/
