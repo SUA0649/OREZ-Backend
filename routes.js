@@ -27,6 +27,70 @@ const pool = new Pool({
 });
 // ----------------------------------------------
 
+
+// ... existing routes ...
+
+// NEW ROUTE: Get recent commits across all repos a user is involved in
+router.get('/users/:userId/recent-commits', async (req, res) => {
+    const { userId } = req.params;
+
+    try {
+        const { rows: commits } = await pool.query(
+            `SELECT
+                c.commit_id,
+                r.name AS repo_name,
+                c.message,
+                c.created_at AS timestamp,
+                u.user_name AS author_name
+            FROM
+                Commit c
+            JOIN
+                users u ON c.owner_id = u.user_id
+            JOIN
+                repository r ON c.repo_id = r.repo_id
+            JOIN
+                RepoPermission rp ON r.repo_id = rp.repo_id
+            WHERE
+                rp.user_id = $1
+            ORDER BY
+                c.created_at DESC
+            LIMIT 3`,
+            [userId]
+        );
+
+        res.json(commits);
+
+    } catch (err) {
+        console.error('GET /recent-commits error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Middleware: check if the requesting user can upload to the repo
+async function checkUploadPermission(req, res, next) {
+  try {
+    const repoId = req.params.repoId;
+    // support user id in body or header (flexible for frontend)
+    const userId = req.body.uploaded_by || req.header('x-user-id');
+    if (!userId) return res.status(401).json({ error: 'Missing user id for upload' });
+
+    const { rows } = await pool.query(
+      'SELECT permission FROM repopermission WHERE repo_id=$1 AND user_id=$2',
+      [repoId, userId]
+    );
+
+    if (!rows.length) return res.status(403).json({ error: 'No permission for this repo' });
+    const perm = rows[0].permission;
+    if (perm !== 'Owner' && perm !== 'Contributor') {
+      return res.status(403).json({ error: 'Insufficient permission to upload' });
+    }
+
+    next();
+  } catch (err) {
+    console.error('checkUploadPermission error:', err);
+    res.status(500).json({ error: err.message });
+  }
+}
 // This just makes that /signup endpoint will make a post request, req and res means request and response
 router.post('/signup', async(req, res) =>{
     //This is the json body that we get from the requst (frontend)
@@ -34,6 +98,7 @@ router.post('/signup', async(req, res) =>{
     const { user_name, password } = req.body;
     //Just hashing the password
     const passwordHash = crypto.createHash('sha256').update(password).digest('hex');
+
     //now insert
     const client = await pool.connect();
     try {
@@ -275,7 +340,7 @@ async function processUploadedFilesAsFolder(repoId, files) {
     client.release();
   }
 }
-router.post('/repos/:repoId/upload-folder', upload.array('files'), async (req, res) => {
+router.post('/repos/:repoId/upload-folder', upload.array('files'), checkUploadPermission, async (req, res) => {
   const { repoId } = req.params;
   const files = req.files;
   
@@ -839,5 +904,30 @@ router.get('/repos/:repoId/diff/:commitId', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Add this utility function near the top of routes.js
+async function getUserRepoPermission(repoId, userId) {
+  // 1. Check if user is the Owner
+  const ownerRes = await pool.query(
+    'SELECT owner_id FROM REPOSITORY WHERE repo_id = $1',
+    [repoId]
+  );
+  if (ownerRes.rows.length > 0 && ownerRes.rows[0].owner_id === userId) {
+    return 'Owner';
+  }
+
+  // 2. Check RepoPermission table
+  const collabRes = await pool.query(
+    'SELECT permission FROM RepoPermission WHERE repo_id = $1 AND user_id = $2',
+    [repoId, userId]
+  );
+  if (collabRes.rows.length > 0) {
+    return collabRes.rows[0].permission;
+  }
+
+  return null; // Not linked
+}
+
+// In routes.js, place this route definition with your other router.get calls
 
 module.exports = router;
