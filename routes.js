@@ -928,6 +928,63 @@ async function getUserRepoPermission(repoId, userId) {
   return null; // Not linked
 }
 
-// In routes.js, place this route definition with your other router.get calls
+// ==================================================================
+// SEARCH & QUERY: FILTER COMMITS
+// Allows searching by Keyword (Message/Author) and Date Range
+// ==================================================================
+router.get('/repos/:repoId/search-commits', async (req, res) => {
+  const { repoId } = req.params;
+  const { keyword, startDate, endDate } = req.query;
+
+  try {
+    // 1. Start building the query
+    let queryText = `
+      SELECT
+         c.commit_id,
+         c.message,
+         c.created_at,
+         u.user_name
+      FROM Commit c
+      JOIN users u ON c.owner_id = u.user_id
+      WHERE c.repo_id = $1
+    `;
+    
+    const queryParams = [repoId];
+    let paramIndex = 2; // Start at $2 because $1 is repoId
+
+    // 2. Add Keyword Filter (Message or Username)
+    if (keyword) {
+      queryText += ` AND (c.message ILIKE $${paramIndex} OR u.user_name ILIKE $${paramIndex})`;
+      queryParams.push(`%${keyword}%`); // Add wildcards for partial matching
+      paramIndex++;
+    }
+
+    // 3. Add Date Range Filter
+    if (startDate) {
+      queryText += ` AND c.created_at >= $${paramIndex}`;
+      queryParams.push(startDate);
+      paramIndex++;
+    }
+
+    if (endDate) {
+      // Add 1 day to include the full end date
+      queryText += ` AND c.created_at <= $${paramIndex}::date + 1`; 
+      queryParams.push(endDate);
+      paramIndex++;
+    }
+
+    // 4. Finish Query
+    queryText += ` ORDER BY c.created_at DESC`;
+
+    // 5. Execute
+    const { rows: commits } = await pool.query(queryText, queryParams);
+    res.json(commits);
+
+  } catch (err) {
+    console.error('Search error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 module.exports = router;
