@@ -315,3 +315,36 @@ BEGIN
     VALUES (p_new_commit_hash, p_repo_id, v_old_tree_id, p_user_id, p_message);
 END;
 $$;
+
+CREATE OR REPLACE FUNCTION get_diff_manifest(root_id INT)
+RETURNS TABLE (
+    file_path TEXT, 
+    blob_hash VARCHAR
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH RECURSIVE walker AS (
+        SELECT 
+            te.name::TEXT as path, 
+            te.mode, 
+            te.child_tree_id, 
+            te.blob_id
+        FROM tree_entry te
+        WHERE te.tree_id = root_id
+
+        UNION ALL
+
+        SELECT 
+            (w.path || '/' || te.name)::TEXT, 
+            te.mode, 
+            te.child_tree_id, 
+            te.blob_id
+        FROM tree_entry te
+        JOIN walker w ON te.tree_id = w.child_tree_id
+    )
+    SELECT w.path, b.hash
+    FROM walker w
+    LEFT JOIN blob b ON w.blob_id = b.blob_id
+    WHERE w.mode = 'blob';
+END;
+$$ LANGUAGE plpgsql;

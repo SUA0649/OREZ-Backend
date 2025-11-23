@@ -298,26 +298,24 @@ router.post('/repos/:repoId/upload-folder', upload.array('files'), async (req, r
 
   const relativePaths = JSON.parse(filePathsJson);
   const client = await pool.connect();
-
   try {
-    //Start transaction
     await client.query('BEGIN');
 
-    // 1. Find the LATEST commit's tree_id (The "Old Root")
+    // 1. Find the Old Root (from previous commit)
     const { rows: latest } = await client.query(
       `SELECT tree_id FROM Commit WHERE repo_id = $1 ORDER BY created_at DESC LIMIT 1`,
       [repoId]
     );
     const oldRootId = latest.length > 0 ? latest[0].tree_id : null;
 
-    // We create a NEW root tree for this snapshot
+    // 2. Create NEW Root Tree
     const { rows: [newRoot] } = await client.query(
       `INSERT INTO tree (hash, repo_id) VALUES ($1, $2) RETURNING tree_id`,
       [crypto.randomBytes(20).toString('hex'), repoId]
     );
     const rootTreeId = newRoot.tree_id;
-    console.log(`Created new snapshot tree: ${rootTreeId} (Old was: ${oldRootId})`);
 
+    // 3. Copy entries from Old Root -> New Root
     if (oldRootId) {
       await client.query(
         `INSERT INTO tree_entry (tree_id, name, mode, blob_id, child_tree_id)
@@ -328,85 +326,128 @@ router.post('/repos/:repoId/upload-folder', upload.array('files'), async (req, r
       );
     }
 
-    // --- Folder helper (This logic is unchanged) ---
-    async function ensureDirTree(pathParts) {
-      let curTreeId = rootTreeId;
+    // --- TRACKING CLONED TREES ---
+    // We track which trees we have already cloned in this transaction 
+    // so we don't clone the same folder twice if multiple files are in it.
+    const clonedTrees = new Set();
+    clonedTrees.add(rootTreeId);
+
+    // --- HELPER: Recursive Copy-on-Write ---
+    async function ensureDirTree(curTreeId, pathParts) {
+      let currentId = curTreeId;
+      
       for (const part of pathParts) {
-        const { rows: existingChild } = await client.query(
-          `SELECT child_tree_id FROM tree_entry WHERE tree_id=$1 AND name=$2 AND mode='tree'`,
-          [curTreeId, part]
+        // Find the child entry in the current tree
+        const res = await client.query(
+          `SELECT entry_id, child_tree_id FROM tree_entry 
+           WHERE tree_id = $1 AND name = $2 AND mode = 'tree'`,
+          [currentId, part]
         );
 
-        if (existingChild.length) {
-          curTreeId = existingChild[0].child_tree_id;
-          continue;
+        let childTreeId;
+
+        if (res.rows.length > 0) {
+          // Folder exists... BUT is it a copy of the old one?
+          const oldChildId = res.rows[0].child_tree_id;
+
+          if (clonedTrees.has(oldChildId)) {
+            // We already cloned it in this transaction. Safe to use.
+            childTreeId = oldChildId;
+          } else {
+            // IT IS AN OLD TREE! We must CLONE it to avoid changing history.
+            const { rows: [newTree] } = await client.query(
+              `INSERT INTO tree (hash, repo_id) VALUES ($1, $2) RETURNING tree_id`,
+              [crypto.randomBytes(20).toString('hex'), repoId]
+            );
+            childTreeId = newTree.tree_id;
+
+            // Copy entries from Old Child -> New Child
+            await client.query(
+              `INSERT INTO tree_entry (tree_id, name, mode, blob_id, child_tree_id)
+               SELECT $1, name, mode, blob_id, child_tree_id
+               FROM tree_entry
+               WHERE tree_id = $2`,
+              [childTreeId, oldChildId]
+            );
+
+            // Update Parent to point to New Child
+            await client.query(
+              `UPDATE tree_entry SET child_tree_id = $1 WHERE tree_id = $2 AND name = $3`,
+              [childTreeId, currentId, part]
+            );
+
+            // Mark as cloned
+            clonedTrees.add(childTreeId);
+          }
+        } else {
+          // Folder doesn't exist at all. Create new.
+          const { rows: [newTree] } = await client.query(
+            `INSERT INTO tree (hash, repo_id) VALUES ($1, $2) RETURNING tree_id`,
+            [crypto.randomBytes(20).toString('hex'), repoId]
+          );
+          childTreeId = newTree.tree_id;
+
+          await client.query(
+            `INSERT INTO tree_entry (tree_id, name, mode, child_tree_id) VALUES ($1, $2, 'tree', $3)`,
+            [currentId, part, childTreeId]
+          );
+          clonedTrees.add(childTreeId);
         }
 
-        const childTreeId = (await client.query(
-          `INSERT INTO tree (hash, repo_id) VALUES ($1, $2) RETURNING tree_id`,
-          [crypto.randomBytes(20).toString('hex'), repoId]
-        )).rows[0].tree_id;
-
-        await client.query(
-          `INSERT INTO tree_entry (tree_id, name, mode, child_tree_id) VALUES ($1, $2, 'tree', $3)`,
-          [curTreeId, part, childTreeId]
-        );
-
-        curTreeId = childTreeId;
+        currentId = childTreeId;
       }
-      return curTreeId;
+      return currentId;
     }
 
-    // --- Process files (This logic is unchanged) ---
+    // --- Process Files ---
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const relPath = relativePaths[i];
-
       const parts = relPath.replace(/\\/g, '/').split('/').filter(p => p !== '');
       if (!parts.length) continue;
 
       const fileName = parts.pop();
       const dirParts = parts;
 
-      const parentTreeId = dirParts.length === 0
-        ? rootTreeId
-        : await ensureDirTree(dirParts);
+      // Use the smart ensureDirTree
+      const parentTreeId = await ensureDirTree(rootTreeId, dirParts);
 
       const hash = crypto.createHash('sha1').update(file.buffer).digest('hex');
       const objectPath = await storeBlobFile(repoId, hash, file.buffer);
 
+      // Insert Blob
       const blobRes = await client.query(
         `INSERT INTO blob (hash, content_path, size) VALUES ($1, $2, $3)
          ON CONFLICT (hash) DO NOTHING RETURNING blob_id`,
         [hash, objectPath, file.size]
       );
+      
+      let blobId;
+      if (blobRes.rows.length > 0) {
+        blobId = blobRes.rows[0].blob_id;
+      } else {
+        const existing = await client.query('SELECT blob_id FROM blob WHERE hash=$1', [hash]);
+        blobId = existing.rows[0].blob_id;
+      }
 
-      const blobId = blobRes.rows.length
-        ? blobRes.rows[0].blob_id
-        : (await client.query('SELECT blob_id FROM blob WHERE hash=$1', [hash])).rows[0].blob_id;
-
+      // Link Blob to Tree
       await client.query(
         `INSERT INTO tree_entry (tree_id, name, mode, blob_id)
          VALUES ($1, $2, 'blob', $3)
          ON CONFLICT (tree_id, name) DO UPDATE SET blob_id = EXCLUDED.blob_id`,
         [parentTreeId, fileName, blobId]
       );
-
-      console.log(`Added file '${fileName}' => blobId=${blobId} under treeId=${parentTreeId}`);
     }
 
-    // --- All file/tree entries are in the database, commit the transaction ---
     await client.query('COMMIT');
 
-    // --- NEW: Create the Commit record to log this snapshot ---
+    // --- Create Commit Record ---
     const commitHash = crypto.createHash('sha1').update(`commit-${rootTreeId}-${Date.now()}`).digest('hex');
-    await pool.query( // Use 'pool' here, transaction is over
+    await pool.query(
       `INSERT INTO Commit (hash, repo_id, tree_id, owner_id, message)
        VALUES ($1, $2, $3, $4, $5)`,
-      [commitHash, repoId, rootTreeId, owner_id, message || 'No commit message']
+      [commitHash, repoId, rootTreeId, owner_id, message || 'File upload']
     );
-    console.log(`Created commit for treeId=${rootTreeId}`);
-    // --- END NEW ---
 
     res.json({ success: true, root_tree_id: rootTreeId });
 
@@ -724,5 +765,79 @@ router.post('/repos/:repoId/collaborators/bulk', async (req, res) => {
   }
 });
 
+// ==================================================================
+// DIFFING: COMPARE COMMIT WITH PARENT
+// ==================================================================
+router.get('/repos/:repoId/diff/:commitId', async (req, res) => {
+  const { repoId, commitId } = req.params;
+
+  try {
+    // 1. Get the Current Commit and its Tree
+    const { rows: [current] } = await pool.query(
+      `SELECT tree_id, created_at FROM Commit WHERE commit_id = $1`,
+      [commitId]
+    );
+    if (!current) return res.status(404).json({ error: 'Commit not found' });
+
+    // 2. Find the Previous Commit (Parent)
+    // We select the most recent commit that happened BEFORE this one
+    const { rows: [parent] } = await pool.query(
+      `SELECT tree_id FROM Commit 
+       WHERE repo_id = $1 AND created_at < $2 
+       ORDER BY created_at DESC LIMIT 1`,
+      [repoId, current.created_at]
+    );
+
+    // 3. Helper to flatten a tree into a simple map: { "path/to/file": "hash" }
+    async function getFlatFileMap(treeId) {
+      if (!treeId) return {};
+      
+      // CALL THE NEW SQL FUNCTION (get_diff_manifest)
+      const { rows } = await pool.query(`SELECT * FROM get_diff_manifest($1)`, [treeId]);
+      
+      const map = {};
+      rows.forEach(r => {
+        // Key by the FULL PATH (e.g. "src/components/App.js")
+        map[r.file_path] = { hash: r.blob_hash, name: r.file_path };
+      });
+      return map;
+    }
+
+    // 4. Get files for both versions
+    const currentFiles = await getFlatFileMap(current.tree_id);
+    const parentFiles = await getFlatFileMap(parent ? parent.tree_id : null);
+
+    // 5. Compare them (The Diff Logic)
+    const changes = [];
+
+    // Check for Modified and Added
+    for (const [name, file] of Object.entries(currentFiles)) {
+      const oldFile = parentFiles[name];
+      
+      if (!oldFile) {
+        changes.push({ type: 'added', name, newHash: file.hash, oldHash: null });
+      } else if (oldFile.hash !== file.hash) {
+        changes.push({ type: 'modified', name, newHash: file.hash, oldHash: oldFile.hash });
+      }
+      // If hashes match, it's 'unchanged', so we skip it.
+    }
+
+    // Check for Deleted
+    for (const [name, file] of Object.entries(parentFiles)) {
+      if (!currentFiles[name]) {
+        changes.push({ type: 'deleted', name, newHash: null, oldHash: file.hash });
+      }
+    }
+
+    res.json({ 
+      parent_found: !!parent,
+      changes 
+    });
+
+  } catch (err) {
+    console.error('Diff error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 module.exports = router;
