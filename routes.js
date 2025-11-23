@@ -327,7 +327,7 @@ router.post('/repos/:repoId/upload-folder', upload.array('files'), async (req, r
         [rootTreeId, oldRootId]
       );
     }
-    
+
     // --- Folder helper (This logic is unchanged) ---
     async function ensureDirTree(pathParts) {
       let curTreeId = rootTreeId;
@@ -630,5 +630,99 @@ router.post('/repos/:repoId/rollback/:commitId', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ==================================================================
+// TCL DEMONSTRATION: BULK ADD COLLABORATORS
+// Uses: BEGIN, SAVEPOINT, ROLLBACK TO, COMMIT, SET TRANSACTION
+// ==================================================================
+router.post('/repos/:repoId/collaborators/bulk', async (req, res) => {
+  const { repoId } = req.params;
+  const { user_names, permission } = req.body;
+
+  if (!user_names || !Array.isArray(user_names)) {
+    return res.status(400).json({ error: 'user_names must be an array' });
+  }
+
+  // We need a dedicated client for transactions (not the pool directly)
+  const client = await pool.connect();
+
+  try {
+    // 1. START TRANSACTION (TCL)
+    await client.query('BEGIN');
+
+    // 2. SET TRANSACTION ISOLATION LEVEL (TCL)
+    // Ensures we see a consistent snapshot of data
+    await client.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+
+    const results = { added: [], failed: [] };
+
+    // Loop through users
+    for (const userName of user_names) {
+      // Create a unique savepoint name for this user iteration
+      const savepointName = `sp_${userName.replace(/[^a-zA-Z0-9]/g, '')}`;
+
+      try {
+        // 3. CREATE SAVEPOINT (TCL)
+        // If the operations below fail, we roll back to HERE, keeping the main transaction alive.
+        await client.query(`SAVEPOINT ${savepointName}`);
+
+        // -- Logic: Find User --
+        const { rows: users } = await client.query(
+          'SELECT user_id FROM users WHERE user_name = $1', 
+          [userName]
+        );
+
+        if (users.length === 0) {
+          throw new Error(`User ${userName} not found`);
+        }
+
+        const userId = users[0].user_id;
+
+        // -- Logic: Insert Permission --
+        await client.query(
+          `INSERT INTO repopermission (user_id, repo_id, permission)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (user_id, repo_id) 
+           DO UPDATE SET permission = $3`,
+          [userId, repoId, permission]
+        );
+
+        // Success! Track it.
+        results.added.push(userName);
+
+        // 4. RELEASE SAVEPOINT (TCL)
+        // Frees up resources for this savepoint
+        await client.query(`RELEASE SAVEPOINT ${savepointName}`);
+
+      } catch (innerErr) {
+        // 5. ROLLBACK TO SAVEPOINT (TCL)
+        // Undo ONLY this user's failure. The transaction continues!
+        await client.query(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+        
+        console.log(`Skipping ${userName}: ${innerErr.message}`);
+        results.failed.push({ user: userName, reason: innerErr.message });
+      }
+    }
+
+    // 6. COMMIT (TCL)
+    // Permanently save all successful operations
+    await client.query('COMMIT');
+
+    res.json({ 
+      success: true, 
+      message: "Bulk process complete", 
+      results 
+    });
+
+  } catch (err) {
+    // Catastrophic failure (DB crash, etc) -> Undo everything
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 
 module.exports = router;
