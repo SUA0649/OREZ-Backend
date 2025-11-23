@@ -22,7 +22,7 @@ const pool = new Pool({
   user: 'orez',
   host: 'localhost',
   database: 'appdb',
-  password: '1231231',
+  password: '123',
   port: 5432,
 });
 // ----------------------------------------------
@@ -109,15 +109,13 @@ router.get('/users', async (req, res) => {
 // Get collaborators for repo
 router.get('/repos/:repoId/collaborators', async (req, res) => {
   const { repoId } = req.params;
-
   try {
-    const { rows } = await pool.query(
-      `SELECT u.user_id, u.user_name, rp.permission
-       FROM repopermission rp
-       JOIN users u ON rp.user_id = u.user_id
-       WHERE rp.repo_id = $1`,
-      [repoId]
-    );
+    const { rows } = await pool.query(`
+      SELECT u.user_name, rp.permission, u.user_id 
+      FROM RepoPermission rp
+      JOIN users u ON rp.user_id = u.user_id
+      WHERE rp.repo_id = $1
+    `, [repoId]);
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -149,36 +147,20 @@ router.post('/repos/:repoId/collaborators', async (req, res) => {
 
   if (!user_name || !permission) return res.status(400).json({ error: 'Missing fields' });
 
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    
-    const { rows: [user] } = await client.query(
-      'SELECT user_id FROM users WHERE user_name = $1', [user_name]
+    // ONE call to the database does everything (Find user + Insert + Audit Log)
+    await pool.query(
+      `CALL add_collaborator_proc($1, $2, $3)`,
+      [repoId, user_name, permission]
     );
-    
-    if (!user) {
-      await client.query('ROLLBACK'); // Rollback before returning an error
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    // If user exists, add or update permission
-    await client.query(
-      `INSERT INTO repopermission (user_id, repo_id, permission)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (user_id, repo_id) DO UPDATE SET permission = EXCLUDED.permission`,
-      [user.user_id, repoId, permission]
-    );
-
-    await client.query('COMMIT');
 
     res.json({ success: true });
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error(err);
+    if (err.message.includes('not found')) {
+        return res.status(404).json({ error: err.message });
+    }
     res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
   }
 });
 
@@ -321,15 +303,31 @@ router.post('/repos/:repoId/upload-folder', upload.array('files'), async (req, r
     //Start transaction
     await client.query('BEGIN');
 
-    // --- REMOVED: We no longer look for the *existing* root tree ---
+    // 1. Find the LATEST commit's tree_id (The "Old Root")
+    const { rows: latest } = await client.query(
+      `SELECT tree_id FROM Commit WHERE repo_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [repoId]
+    );
+    const oldRootId = latest.length > 0 ? latest[0].tree_id : null;
+
     // We create a NEW root tree for this snapshot
     const { rows: [newRoot] } = await client.query(
       `INSERT INTO tree (hash, repo_id) VALUES ($1, $2) RETURNING tree_id`,
       [crypto.randomBytes(20).toString('hex'), repoId]
     );
     const rootTreeId = newRoot.tree_id;
-    console.log(`Created new snapshot tree for repoId=${repoId} => treeId=${rootTreeId}`);
+    console.log(`Created new snapshot tree: ${rootTreeId} (Old was: ${oldRootId})`);
 
+    if (oldRootId) {
+      await client.query(
+        `INSERT INTO tree_entry (tree_id, name, mode, blob_id, child_tree_id)
+         SELECT $1, name, mode, blob_id, child_tree_id
+         FROM tree_entry
+         WHERE tree_id = $2`,
+        [rootTreeId, oldRootId]
+      );
+    }
+    
     // --- Folder helper (This logic is unchanged) ---
     async function ensureDirTree(pathParts) {
       let curTreeId = rootTreeId;
@@ -428,7 +426,7 @@ router.get('/repos/:repoId/files', async (req, res) => {
   try {
     let rootTreeId = null;
 
-    // --- NEW: Find the tree from the LATEST commit ---
+    // 1. Find the tree from the LATEST commit
     const { rows: latestCommit } = await pool.query(
       `SELECT tree_id FROM Commit 
        WHERE repo_id = $1 
@@ -438,52 +436,27 @@ router.get('/repos/:repoId/files', async (req, res) => {
     );
 
     if (latestCommit.length > 0) {
-      //  We found a commit, use its tree 
       rootTreeId = latestCommit[0].tree_id;
     } else {
-      //  No commits yet (new repo), find the initial empty tree 
+      // Fallback for new/empty repos
       const { rows: rootRows } = await pool.query(
         `SELECT tree_id FROM tree WHERE repo_id=$1 ORDER BY tree_id LIMIT 1`,
         [repoId]
       );
-      if (rootRows.length) {
-        rootTreeId = rootRows[0].tree_id;
-      }
+      if (rootRows.length) rootTreeId = rootRows[0].tree_id;
     }
-    //  END NEW 
 
     if (rootTreeId === null) {
-      // This repo is empty and has no trees
       return res.json({ root_tree_id: null, entries: [] });
     }
 
+    // 2. CALL YOUR NEW SQL FUNCTION (Clean & Fast!)
     const { rows: entries } = await pool.query(
-      `WITH RECURSIVE file_tree AS (
-         -- Start with the root tree
-         SELECT tree_id, name, mode, child_tree_id, blob_id
-         FROM tree_entry
-         WHERE tree_id = $1
-         
-         UNION ALL
-         
-         -- Recursively find all children
-         SELECT te.tree_id, te.name, te.mode, te.child_tree_id, te.blob_id
-         FROM tree_entry te
-         INNER JOIN file_tree ft ON te.tree_id = ft.child_tree_id
-       )
-       SELECT 
-         ft.tree_id, 
-         ft.name, 
-         ft.mode, 
-         ft.child_tree_id, 
-         ft.blob_id, 
-         b.hash AS blob_hash, 
-         b.size AS blob_size
-       FROM file_tree ft
-       LEFT JOIN blob b ON ft.blob_id = b.blob_id;`,
+      `SELECT * FROM get_file_tree($1)`, 
       [rootTreeId]
     );
 
+    // 3. Format for frontend
     const formatted = entries.map(e => ({
       tree_id: e.tree_id,
       name: e.name,
@@ -505,26 +478,13 @@ router.get('/repos/:repoId/tree/:treeId', async (req, res) => {
   const { treeId } = req.params;
 
   try {
+    // 1. CALL YOUR NEW SQL FUNCTION DIRECTLY
     const { rows: entries } = await pool.query(
-      `WITH RECURSIVE file_tree AS (
-         SELECT tree_id, name, mode, child_tree_id, blob_id
-         FROM tree_entry
-         WHERE tree_id = $1
-
-         UNION ALL
-
-         SELECT te.tree_id, te.name, te.mode, te.child_tree_id, te.blob_id
-         FROM tree_entry te
-         INNER JOIN file_tree ft ON te.tree_id = ft.child_tree_id
-       )
-       SELECT 
-         ft.tree_id, ft.name, ft.mode, ft.child_tree_id, ft.blob_id, 
-         b.hash AS blob_hash, b.size AS blob_size
-       FROM file_tree ft
-       LEFT JOIN blob b ON ft.blob_id = b.blob_id;`,
+      `SELECT * FROM get_file_tree($1)`, 
       [treeId]
     );
 
+    // 2. Format for frontend
     const formatted = entries.map(e => ({
       tree_id: e.tree_id,
       name: e.name,
@@ -559,14 +519,7 @@ router.get('/repos/:repoId/blob/:hash', async (req, res) => {
     const storageDir = path.resolve(__dirname, 'blobs');
     const safePath = path.resolve(blob.content_path);
 
-    console.log('--- DEBUG BLOB FETCH ---');
-    console.log('1. Expected Base Dir:', storageDir);
-    console.log('2. Database Stored Path:', blob.content_path);
-    console.log('3. Resolved Safe Path:', safePath);
-    console.log('4. Match Check:', safePath.startsWith(storageDir));
-
     if (!safePath.startsWith(storageDir)) {
-      console.log('❌ BLOCKING REQUEST: Path mismatch');
       return res.status(403).json({ error: 'Forbidden' });
     }
 
@@ -654,5 +607,28 @@ router.get('/repos/:repoId/download', async (req, res) => {
   }
 });
 
+// ---- NEW ENDPOINT: ROLLBACK TO A PREVIOUS COMMIT ----
+router.post('/repos/:repoId/rollback/:commitId', async (req, res) => {
+  const { repoId, commitId } = req.params;
+  const { user_id } = req.body; // We need to know WHO is rolling back
+
+  try {
+    // 1. Generate a new hash for this "Revert" commit
+    const newHash = crypto.randomBytes(20).toString('hex');
+    const message = `Rollback to commit #${commitId}`;
+
+    // 2. Call the Database Procedure
+    await pool.query(
+      `CALL restore_commit_proc($1, $2, $3, $4, $5)`,
+      [repoId, user_id, commitId, newHash, message]
+    );
+
+    res.json({ success: true, message: "Rollback successful" });
+
+  } catch (err) {
+    console.error('Rollback error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 module.exports = router;

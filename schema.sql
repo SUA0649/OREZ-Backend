@@ -1,18 +1,20 @@
 /*
--- ALl of this is specific for POSTGRES DB
- To run the schema in docker and ensure all the tables are successfully created.
-docker cp schema.sql {container_name}:/tmp/schema.sql -- copying the file from local to the docker environment
-docker exec -it {container_name} psql -U {user_name} -d {DB_name} -f /schema.sql --This copies the schema to the database
-to Ensure table creation 
-docker exec -it {container_name} psql -U {user_name} -d {DB_name}
-appdb#= \dt --Write this command in the psql cmd and then you'll see the table over there.  
+-- ALL of this is specific for POSTGRES DB
+-- To run the schema in docker and ensure all the tables are successfully created:
+   docker cp schema.sql postgresdb:/tmp/schema.sql
+   docker exec -it postgresdb psql -U orez -d appdb -f /tmp/schema.sql
 */
 
-CREATE TABLE IF NOT EXISTS users( --OWNERS
+-- ==========================================
+-- 1. CORE TABLES
+-- ==========================================
+
+CREATE TABLE IF NOT EXISTS users(
     user_id serial primary key,
     user_name varchar(30) not null unique,
     password_hash varchar(255) not null,
-    created_at TIMESTAMP default CURRENT_TIMESTAMP
+    created_at TIMESTAMP default CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP default CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS REPOSITORY(
@@ -20,63 +22,185 @@ CREATE TABLE IF NOT EXISTS REPOSITORY(
     name varchar(50) not null,
     description varchar(100) not null,
     owner_id int references users(user_id) not null,
-    created_at TIMESTAMP default CURRENT_TIMESTAMP
+    created_at TIMESTAMP default CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP default CURRENT_TIMESTAMP
 ); 
 
 CREATE TABLE IF NOT EXISTS RepoPermission(
     user_id int references users(user_id) not null,
     repo_id int references REPOSITORY(repo_id) not null,
     permission varchar(20) not null check (permission in ('Owner','Viewer','Contributor')),
+    created_at TIMESTAMP default CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP default CURRENT_TIMESTAMP,
     UNIQUE(user_id, repo_id)
 );
 
-CREATE TABLE IF NOT EXISTS Blob ( -- This is a pointer to each individual file.
+CREATE TABLE IF NOT EXISTS Blob (
     blob_id serial primary key,
     hash varchar(100) not null unique,
     content_path varchar(200) not null unique,
-    size int not null, -- Not sure why I need this will explore later.
+    size int not null, 
     created_at TIMESTAMP default CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS Tree(  -- This is similar to how a folder works, a tree is a folder which contains some contents.
+CREATE TABLE IF NOT EXISTS Tree(
     tree_id serial primary key,
     hash varchar(100) not null unique,
     repo_id int references REPOSITORY(repo_id) not null,
     created_at TIMESTAMP default CURRENT_TIMESTAMP
 ); 
 
-CREATE TABLE IF NOT EXISTS Tree_Entry( -- This table is used to link the tree and the blobs together.
+CREATE TABLE IF NOT EXISTS Tree_Entry(
     entry_id serial primary key,
     tree_id int references Tree(tree_id) not null, 
-    
     name VARCHAR(255) NOT NULL, 
     mode VARCHAR(10) NOT NULL,  
-    
     blob_id int references Blob(blob_id), 
     child_tree_id int references Tree(tree_id), 
-    
     UNIQUE(tree_id, name) 
 );
 
-
 CREATE TABLE IF NOT EXISTS Commit(
     commit_id serial primary key,
-    hash varchar(100) not null, -- The different hashes are to hide exactly where the file contents are stored.
+    hash varchar(100) not null,
     repo_id int references REPOSITORY(repo_id) not null,
-    tree_id int references Tree(tree_id) not null, -- The not null is to ensure that at least root tree exists\
+    tree_id int references Tree(tree_id) not null,
     owner_id int references users(user_id) not null,
     message varchar(100) not null,
     created_at TIMESTAMP default CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS Commit_Parent( -- To Track the commits.
+CREATE TABLE IF NOT EXISTS Commit_Parent(
     parent_id serial primary key,
     commit_id int references Commit(commit_id) not null,
     parent_commit int references Commit(commit_id)
 );
 
+-- New Table: Audit Log for tracking security changes
+CREATE TABLE IF NOT EXISTS audit_log (
+    log_id SERIAL PRIMARY KEY,
+    table_name VARCHAR(50),
+    action_type VARCHAR(10),
+    repo_id INT,
+    details TEXT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
--- Function to create a new repository, its owner permission, and its initial root tree
+-- ==========================================
+-- 2. AUTOMATION TRIGGERS (Timestamps)
+-- ==========================================
+
+-- Generic function to auto-update 'updated_at' columns
+CREATE OR REPLACE FUNCTION update_modified_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach to Users
+DROP TRIGGER IF EXISTS update_users_modtime ON users;
+CREATE TRIGGER update_users_modtime
+BEFORE UPDATE ON users
+FOR EACH ROW EXECUTE FUNCTION update_modified_column();
+
+-- Attach to Repository
+DROP TRIGGER IF EXISTS update_repo_modtime ON repository;
+CREATE TRIGGER update_repo_modtime
+BEFORE UPDATE ON repository
+FOR EACH ROW EXECUTE FUNCTION update_modified_column();
+
+CREATE OR REPLACE FUNCTION update_permission_timestamp()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS tr_update_permission_timestamp ON RepoPermission;
+CREATE TRIGGER tr_update_permission_timestamp
+BEFORE UPDATE ON RepoPermission
+FOR EACH ROW EXECUTE FUNCTION update_permission_timestamp();
+
+-- ==========================================
+-- 3. AUDIT LOG TRIGGERS
+-- ==========================================
+
+CREATE OR REPLACE FUNCTION log_permission_change()
+RETURNS TRIGGER AS $$
+DECLARE
+    target_repo_id INT;
+BEGIN
+    -- Determine repo_id based on operation
+    IF (TG_OP = 'DELETE') THEN
+        target_repo_id := OLD.repo_id;
+    ELSE
+        target_repo_id := NEW.repo_id;
+    END IF;
+
+    IF (TG_OP = 'INSERT') THEN
+        INSERT INTO audit_log (table_name, action_type, repo_id, details)
+        VALUES ('RepoPermission', 'INSERT', target_repo_id, 'User ' || NEW.user_id || ' added as ' || NEW.permission);
+        RETURN NEW;
+    ELSIF (TG_OP = 'UPDATE') THEN
+        INSERT INTO audit_log (table_name, action_type, repo_id, details)
+        VALUES ('RepoPermission', 'UPDATE', target_repo_id, 'User ' || NEW.user_id || ' role changed to ' || NEW.permission);
+        RETURN NEW;
+    ELSIF (TG_OP = 'DELETE') THEN
+        INSERT INTO audit_log (table_name, action_type, repo_id, details)
+        VALUES ('RepoPermission', 'DELETE', target_repo_id, 'User ' || OLD.user_id || ' removed');
+        RETURN OLD;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS audit_repo_permissions ON RepoPermission;
+CREATE TRIGGER audit_repo_permissions
+AFTER INSERT OR UPDATE OR DELETE ON RepoPermission
+FOR EACH ROW EXECUTE FUNCTION log_permission_change();
+
+-- ==========================================
+-- 4. BUSINESS LOGIC TRIGGERS
+-- ==========================================
+
+-- Automatically grant 'Owner' permission when a repo is created
+CREATE OR REPLACE FUNCTION grant_owner_permission()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO RepoPermission (user_id, repo_id, permission)
+    VALUES (NEW.owner_id, NEW.repo_id, 'Owner')
+    ON CONFLICT (user_id, repo_id) DO NOTHING;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS tr_grant_owner_permission ON REPOSITORY;
+CREATE TRIGGER tr_grant_owner_permission
+AFTER INSERT ON REPOSITORY
+FOR EACH ROW EXECUTE FUNCTION grant_owner_permission();
+
+-- Delete permissions when a repo is deleted
+CREATE OR REPLACE FUNCTION delete_repo_permissions()
+RETURNS TRIGGER AS $$
+BEGIN
+    DELETE FROM RepoPermission WHERE repo_id = OLD.repo_id;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS tr_delete_repo_permissions ON REPOSITORY;
+CREATE TRIGGER tr_delete_repo_permissions
+BEFORE DELETE ON REPOSITORY
+FOR EACH ROW EXECUTE FUNCTION delete_repo_permissions();
+
+-- ==========================================
+-- 5. STORED PROCEDURES (Transactions)
+-- ==========================================
+
+-- Function to create a new repository (replaces complex JS logic)
 CREATE OR REPLACE FUNCTION create_new_repository(
     repo_name VARCHAR(50),
     repo_description VARCHAR(100),
@@ -85,83 +209,109 @@ CREATE OR REPLACE FUNCTION create_new_repository(
 RETURNS INT AS $$
 DECLARE
     new_repo_id INT;
-    root_tree_id INT;
 BEGIN
-    -- 1. Create the Repository
     INSERT INTO REPOSITORY (name, description, owner_id)
     VALUES (repo_name, repo_description, owner_id_in)
     RETURNING repo_id INTO new_repo_id;
 
-    -- 2. Add Owner Permission
-    --Handled by trigger now
---    INSERT INTO RepoPermission (user_id, repo_id, permission)
---    VALUES (owner_id_in, new_repo_id, 'Owner');
-
-    -- 3. Create initial Root Tree (using a placeholder hash for now)
-    INSERT INTO Tree (hash, repo_id)
-    VALUES (md5(random()::text), new_repo_id) -- Using md5(random()::text) for a quick unique hash
-    RETURNING tree_id INTO root_tree_id;
-
-    -- Return the ID of the new repository
+    -- Initial Tree creation is handled by JS currently, 
+    -- but this function handles the Repo + Permission (via trigger)
+    
     RETURN new_repo_id;
 END;
 $$ LANGUAGE plpgsql;
 
-
--- Function: Automatically grants 'Owner' permission upon repository creation.
-CREATE OR REPLACE FUNCTION grant_owner_permission()
-RETURNS TRIGGER AS $$
+-- Procedure to Add Collaborator (Handles User Lookup + Insert + Validation)
+CREATE OR REPLACE PROCEDURE add_collaborator_proc(
+    p_repo_id INT,
+    p_user_name VARCHAR,
+    p_permission VARCHAR
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_user_id INT;
 BEGIN
-    -- Insert the owner into RepoPermission with 'Owner' role.
-    -- The new repository's details are in the 'NEW' record.
-    INSERT INTO RepoPermission (user_id, repo_id, permission)
-    VALUES (NEW.owner_id, NEW.repo_id, 'Owner')
-    ON CONFLICT (user_id, repo_id) DO NOTHING; -- Prevents errors if permission is somehow already set
+    -- 1. Find the User ID
+    SELECT user_id INTO v_user_id FROM users WHERE user_name = p_user_name;
     
-    RETURN NEW; -- Return the row being inserted into REPOSITORY
+    -- 2. Validation
+    IF v_user_id IS NULL THEN
+        RAISE EXCEPTION 'User % not found', p_user_name;
+    END IF;
+
+    -- 3. Insert or Update Permission
+    INSERT INTO repopermission (user_id, repo_id, permission)
+    VALUES (v_user_id, p_repo_id, p_permission)
+    ON CONFLICT (user_id, repo_id) 
+    DO UPDATE SET permission = p_permission;
+END;
+$$;
+
+-- ==========================================
+-- 6. QUERY FUNCTIONS (Complex Reads)
+-- ==========================================
+
+-- Function to recursively get all files for a tree
+CREATE OR REPLACE FUNCTION get_file_tree(root_id INT)
+RETURNS TABLE (
+    tree_id INT, 
+    name VARCHAR, 
+    mode VARCHAR, 
+    child_tree_id INT, 
+    blob_id INT, 
+    blob_hash VARCHAR, 
+    blob_size INT
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH RECURSIVE file_tree AS (
+        SELECT te.tree_id, te.name, te.mode, te.child_tree_id, te.blob_id
+        FROM tree_entry te
+        WHERE te.tree_id = root_id
+        
+        UNION ALL
+        
+        SELECT te.tree_id, te.name, te.mode, te.child_tree_id, te.blob_id
+        FROM tree_entry te
+        INNER JOIN file_tree ft ON te.tree_id = ft.child_tree_id
+    )
+    SELECT 
+        ft.tree_id, ft.name, ft.mode, ft.child_tree_id, ft.blob_id, 
+        b.hash, b.size
+    FROM file_tree ft
+    LEFT JOIN blob b ON ft.blob_id = b.blob_id;
 END;
 $$ LANGUAGE plpgsql;
 
--- Trigger: Fires AFTER a row is inserted into REPOSITORY
-CREATE TRIGGER tr_grant_owner_permission
-AFTER INSERT ON REPOSITORY
-FOR EACH ROW
-EXECUTE FUNCTION grant_owner_permission();
+-- ==========================================
+-- 7. ROLLBACK PROCEDURE
+-- ==========================================
 
-
-
--- Function: Deletes all associated permissions when a repository is deleted.
-CREATE OR REPLACE FUNCTION delete_repo_permissions()
-RETURNS TRIGGER AS $$
+-- Procedure to Rollback (Restore) a version
+CREATE OR REPLACE PROCEDURE restore_commit_proc(
+    p_repo_id INT,
+    p_user_id INT,
+    p_commit_id_to_restore INT,
+    p_new_commit_hash VARCHAR,
+    p_message VARCHAR
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_old_tree_id INT;
 BEGIN
-    -- Delete permissions associated with the deleted repository.
-    -- The deleted repository's details are in the 'OLD' record.
-    DELETE FROM RepoPermission WHERE repo_id = OLD.repo_id;
-    
-    RETURN OLD; -- Return the deleted row
+    -- 1. Get the Tree ID from the old commit
+    SELECT tree_id INTO v_old_tree_id 
+    FROM Commit 
+    WHERE commit_id = p_commit_id_to_restore;
+
+    IF v_old_tree_id IS NULL THEN
+        RAISE EXCEPTION 'Commit % not found', p_commit_id_to_restore;
+    END IF;
+
+    -- 2. Create a NEW commit pointing to that OLD tree
+    INSERT INTO Commit (hash, repo_id, tree_id, owner_id, message)
+    VALUES (p_new_commit_hash, p_repo_id, v_old_tree_id, p_user_id, p_message);
 END;
-$$ LANGUAGE plpgsql;
-
--- Trigger: Fires BEFORE a row is deleted from REPOSITORY
-CREATE TRIGGER tr_delete_repo_permissions
-BEFORE DELETE ON REPOSITORY
-FOR EACH ROW
-EXECUTE FUNCTION delete_repo_permissions();
-
-
--- Function: Updates the timestamp when a RepoPermission record is modified.
-CREATE OR REPLACE FUNCTION update_permission_timestamp()
-RETURNS TRIGGER AS $$
-BEGIN
-    -- Set the created_at to the current timestamp
-    NEW.created_at = CURRENT_TIMESTAMP;
-    
-    RETURN NEW; -- Return the row being updated
-END;
-$$ LANGUAGE plpgsql;
-
--- Trigger: Fires BEFORE an UPDATE on RepoPermission
-CREATE TRIGGER tr_update_permission_timestamp
-BEFORE UPDATE ON RepoPermission
-FOR EACH ROW
-EXECUTE FUNCTION update_permission_timestamp();
+$$;
