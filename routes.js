@@ -1086,5 +1086,68 @@ router.get('/repos/:repoId/search-commits', async (req, res) => {
   }
 });
 
+// ==================================================================
+// ANALYTICS & AI MODULE
+// ==================================================================
+const Sentiment = require('sentiment');
+const sentiment = new Sentiment();
+
+router.get('/repos/:repoId/analytics', async (req, res) => {
+  const { repoId } = req.params;
+
+  try {
+    // 1. Get Activity Stats (SQL Aggregation)
+    const { rows: activity } = await pool.query(
+      `SELECT * FROM get_commit_activity($1)`,
+      [repoId]
+    );
+
+    // 2. Get AI Sentiment Analysis on Commit History
+    // We score the commit messages
+    const { rows: commits } = await pool.query(
+      `SELECT c.message, c.created_at, u.user_name 
+       FROM Commit c JOIN users u ON c.owner_id = u.user_id
+       WHERE c.repo_id = $1 ORDER BY c.created_at ASC`, 
+      [repoId]
+    );
+
+    const sentimentData = commits.map(c => {
+      const analysis = sentiment.analyze(c.message);
+      return {
+        date: c.created_at,
+        author: c.user_name,
+        message: c.message,
+        score: analysis.score, // >0 (Positive), <0 (Negative), 0 (Neutral)
+        comparative: analysis.comparative // Score adjusted for length
+      };
+    });
+
+    // 3. Get Code Clones (Type 1)
+    const { rows: [latest] } = await pool.query(
+        `SELECT tree_id FROM Commit WHERE repo_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        [repoId]
+    );
+    
+    let clones = [];
+    if (latest) {
+        const { rows: cloneRows } = await pool.query(
+            `SELECT * FROM get_code_clones($1)`, 
+            [latest.tree_id]
+        );
+        clones = cloneRows;
+    }
+
+    res.json({
+      activity,
+      sentiment: sentimentData,
+      clones
+    });
+
+  } catch (err) {
+    console.error('Analytics error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 module.exports = router;

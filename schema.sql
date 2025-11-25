@@ -361,3 +361,63 @@ CREATE TABLE IF NOT EXISTS Rollback_Request (
     status VARCHAR(20) DEFAULT 'Pending', -- Pending, Approved, Rejected
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ==========================================
+-- 9. ANALYTICS MODULE
+-- ==========================================
+
+-- 1. Get Daily Commit Counts (For Activity Graph)
+CREATE OR REPLACE FUNCTION get_commit_activity(p_repo_id INT)
+RETURNS TABLE (
+    commit_date DATE,
+    commit_count BIGINT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        DATE(created_at) as day, 
+        COUNT(*) as cnt
+    FROM Commit 
+    WHERE repo_id = p_repo_id
+    GROUP BY DATE(created_at)
+    ORDER BY day ASC;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 2. Detect Type 1 Clones (Identical Files) using Hash Collisions
+CREATE OR REPLACE FUNCTION get_code_clones(p_tree_id INT)
+RETURNS TABLE (
+    blob_hash VARCHAR,
+    file_count BIGINT,
+    file_paths TEXT
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH RECURSIVE file_list AS (
+        -- Traverse the tree to get all files
+        SELECT te.blob_id, te.name::TEXT as path
+        FROM tree_entry te
+        WHERE te.tree_id = p_tree_id AND te.mode = 'blob'
+        
+        UNION ALL
+        
+        SELECT te.blob_id, (fl.path || '/' || te.name)::TEXT
+        FROM tree_entry te
+        JOIN file_list fl ON te.tree_id = (
+            SELECT child_tree_id FROM tree_entry WHERE entry_id = te.entry_id
+        )
+        WHERE te.mode = 'blob' 
+    ),
+    all_files AS (
+        -- Reuse existing manifest logic if available, or simple recursive select
+        SELECT * FROM get_diff_manifest(p_tree_id)
+    )
+    SELECT 
+        a.blob_hash, 
+        COUNT(*) as count,
+        STRING_AGG(a.file_path, ', ') as paths
+    FROM all_files a
+    GROUP BY a.blob_hash
+    HAVING COUNT(*) > 1; -- Only show blobs used more than once (Clones)
+END;
+$$ LANGUAGE plpgsql;
