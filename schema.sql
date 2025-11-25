@@ -421,3 +421,76 @@ BEGIN
     HAVING COUNT(*) > 1; -- Only show blobs used more than once (Clones)
 END;
 $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION delete_repository_proc(p_repo_id INT)
+RETURNS TABLE (deleted_content_path TEXT)
+LANGUAGE plpgsql AS
+$$
+DECLARE
+    b_record RECORD;
+    ids_to_delete INT[] := ARRAY[]::INT[]; -- Array to collect blob IDs for DB deletion
+BEGIN
+    -- Ensure repo exists; else raise exception
+    IF NOT EXISTS (SELECT 1 FROM repository WHERE repo_id = p_repo_id) THEN
+        RAISE EXCEPTION 'Repository % not found', p_repo_id;
+    END IF;
+
+    -- 1) Collect content_paths and blob_ids of blobs that are referenced only by this repo.
+    FOR b_record IN
+      SELECT bl.blob_id, bl.content_path -- FIX: Selecting blob_id for array collection
+      FROM blob bl
+      WHERE bl.blob_id IN (
+        SELECT te.blob_id
+        FROM tree_entry te
+        JOIN tree t ON te.tree_id = t.tree_id
+        WHERE t.repo_id = p_repo_id AND te.blob_id IS NOT NULL
+      )
+      AND NOT EXISTS (
+        -- ensure no other repo references this blob through tree_entry -> tree
+        SELECT 1 FROM tree_entry te2
+        JOIN tree t2 ON te2.tree_id = t2.tree_id
+        WHERE te2.blob_id = bl.blob_id
+          AND t2.repo_id <> p_repo_id
+      )
+    LOOP
+        deleted_content_path := b_record.content_path;
+        RETURN NEXT;
+        -- Collect the ID for database deletion (after the physical file is removed by the server)
+        ids_to_delete := array_append(ids_to_delete, b_record.blob_id);
+    END LOOP;
+
+    -- 2) Delete commit-parent links for commits of this repo
+    DELETE FROM Commit_Parent
+    WHERE commit_id IN (SELECT commit_id FROM Commit WHERE repo_id = p_repo_id)
+       OR parent_commit IN (SELECT commit_id FROM Commit WHERE repo_id = p_repo_id);
+
+    -- 3) Delete commits belonging to this repo
+    DELETE FROM Commit WHERE repo_id = p_repo_id;
+
+    -- 4) Delete tree entries belonging to trees of this repo
+    -- This MUST happen BEFORE deleting the referenced Blob records (Step 5).
+    DELETE FROM Tree_Entry
+    WHERE tree_id IN (SELECT tree_id FROM Tree WHERE repo_id = p_repo_id);
+
+    -- 5) Delete the collected Blob records from the database
+    -- FIX: Moved to this position to satisfy the FK constraint from Tree_Entry.
+    DELETE FROM Blob
+    WHERE blob_id = ANY(ids_to_delete);
+
+    -- 6) Delete trees belonging to this repo
+    DELETE FROM Tree WHERE repo_id = p_repo_id;
+
+    -- 7) Delete permissions for this repo
+    DELETE FROM RepoPermission WHERE repo_id = p_repo_id;
+
+    -- 8) Delete the repository itself
+    DELETE FROM REPOSITORY WHERE repo_id = p_repo_id;
+
+    -- 9) Delete orphaned blobs from DB (final cleanup for truly unreferenced records)
+    DELETE FROM Blob b
+    WHERE NOT EXISTS (SELECT 1 FROM Tree_Entry te WHERE te.blob_id = b.blob_id);
+
+    RETURN;
+END;
+$$;
+

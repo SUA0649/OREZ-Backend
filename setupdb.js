@@ -14,6 +14,13 @@ const pool = new Pool({
 
 async function setup() {
   try {
+    // 0️⃣ Drop existing schema (clean slate for development)
+    await pool.query(`
+      DROP SCHEMA IF EXISTS public CASCADE;
+      CREATE SCHEMA public;
+    `);
+    console.log('✅ Old schema dropped');
+
     // 1️⃣ Create schema
     const schemaSQL = await fs.readFile('schema.sql', 'utf8');
     await pool.query(schemaSQL);

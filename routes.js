@@ -1150,4 +1150,273 @@ router.get('/repos/:repoId/analytics', async (req, res) => {
 });
 
 
+// DELETE /repos/:repoId
+router.delete('/repos/:repoId', async (req, res) => {
+  const { repoId } = req.params;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // Call the procedure to delete repo + dependent DB rows.
+    // It RETURNS rows (deleted_content_path) for files to delete from disk.
+    const { rows } = await client.query('SELECT deleted_content_path FROM delete_repository_proc($1)', [repoId]);
+
+    await client.query('COMMIT');
+
+    // rows is an array of { deleted_content_path: '/path/to/file' }
+    // Delete each file; log failures but don't try to rollback DB (DB already committed).
+    const deletedPaths = rows.map(r => r.deleted_content_path).filter(Boolean);
+
+    for (const p of deletedPaths) {
+      try {
+        // Make sure path is resolved within your blobs directory
+        const safePath = path.resolve(__dirname, p);
+        const blobsDir = path.resolve(__dirname, 'blobs');
+
+        if (!safePath.startsWith(blobsDir)) {
+          console.warn('Skipping unsafe blob path:', safePath);
+          continue;
+        }
+
+        // remove file (if present)
+        await fs.remove(safePath);
+      } catch (fileErr) {
+        // Log but continue: DB is already committed. Consider alerting/monitoring.
+        console.error('Failed to remove blob file', p, fileErr);
+      }
+    }
+
+    // Finally, remove the repo's blobs folder if it exists (cleans leftover structure)
+    try {
+      const repoFolder = path.join(__dirname, 'blobs', String(repoId));
+      await fs.remove(repoFolder);
+    } catch (folderErr) {
+      console.error('Failed to remove repo blobs folder:', folderErr);
+    }
+
+    res.json({ success: true, deleted_files: deletedPaths.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('DELETE /repos error:', err);
+    if (err.code && err.code.startsWith('P')) {
+      // DB related error
+    }
+    // If the error was the repository not found (from the function exception),
+    // return 404 for clarity
+    if (err.message && err.message.includes('not found')) {
+      return res.status(404).json({ error: err.message });
+    }
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+// routes.js (Updated with deletion logic and SQL fix)
+
+// Assuming necessary imports like 'express', 'Pool', and 'crypto' are present
+// const express = require('express');
+// const router = express.Router();
+// const { Pool } = require('pg');
+// const crypto = require('crypto');
+// const pool = new Pool({...});
+
+// ===============================================
+// HELPER FUNCTION: Recursively Rebuild Tree (for deletion)
+// ===============================================
+
+/**
+ * Recursively reconstructs the tree after a deletion.
+ * Creates new Tree records for all affected parent directories (content-addressable).
+ *
+ * @param {object} client - The active PG transaction client.
+ * @param {number} repoId - The repository ID.
+ * @param {number} currentTreeId - The ID of the tree to search within (recursively).
+ * @param {string[]} pathSegments - The remaining path to the item to delete (e.g., ['components', 'Button.jsx']).
+ * @returns {Promise<number>} - The new ID of the updated tree.
+ * @throws {Error} - If the item to delete is not found or is a file in the middle of a path.
+ */
+async function rebuildTreeAfterDeletion(client, repoId, currentTreeId, pathSegments) {
+    const segmentName = pathSegments[0];
+    const isTarget = pathSegments.length === 1;
+
+    // 1. Fetch all entries of the current tree (FIX: Using child_tree_id)
+    const { rows: entries } = await client.query(
+        `SELECT
+            te.name, te.mode, te.blob_id, te.child_tree_id AS linked_tree_id
+         FROM Tree_Entry te
+         WHERE te.tree_id = $1
+         ORDER BY te.name`,
+        [currentTreeId]
+    );
+
+    // Filter out the entry to be deleted if we are at the target level
+    let updatedEntries = entries.filter(entry => entry.name !== segmentName);
+
+    // Find the entry that corresponds to the current segment
+    const targetEntry = entries.find(entry => entry.name === segmentName);
+
+    if (!targetEntry) {
+        throw new Error(`Item not found: ${pathSegments.join('/')}`);
+    }
+
+    if (!isTarget) {
+        // Case 2: The item is deeper in the structure (target is a subdirectory).
+        if (targetEntry.mode !== 'tree' || !targetEntry.linked_tree_id) {
+             throw new Error(`Path segment '${segmentName}' is not a folder, but expected a folder for path traversal.`);
+        }
+
+        // Recursively call for the next level
+        const newSubTreeId = await rebuildTreeAfterDeletion(
+            client,
+            repoId,
+            targetEntry.linked_tree_id,
+            pathSegments.slice(1) // Pass the rest of the path
+        );
+
+        // Create a new entry pointing to the new subtree
+        const newTargetEntry = {
+            name: targetEntry.name,
+            mode: targetEntry.mode, // 'tree'
+            blob_id: null,
+            linked_tree_id: newSubTreeId
+        };
+        
+        // Add the updated entry back into the list
+        updatedEntries.push(newTargetEntry);
+        updatedEntries.sort((a, b) => a.name.localeCompare(b.name));
+    }
+    
+    // 2. Calculate the hash of the new tree's content
+    const treeContent = updatedEntries.map(entry =>
+        `${entry.mode}:${entry.linked_tree_id || entry.blob_id}:${entry.name}`
+    ).join('\n');
+    
+    // Assuming crypto is available via `const crypto = require('crypto');`
+    const newTreeHash = crypto.createHash('sha1').update(treeContent).digest('hex');
+
+    // 3. Check for existing tree with this hash (Content-addressability)
+    const { rows: existingTree } = await client.query(
+        `SELECT tree_id FROM Tree WHERE repo_id = $1 AND hash = $2`,
+        [repoId, newTreeHash]
+    );
+
+    if (existingTree.length > 0) {
+        // Tree content is identical to an existing tree, reuse its ID
+        return existingTree[0].tree_id;
+    }
+
+    // 4. Insert the new Tree record
+    const { rows: newTreeRow } = await client.query(
+        `INSERT INTO Tree (repo_id, hash) VALUES ($1, $2) RETURNING tree_id`,
+        [repoId, newTreeHash]
+    );
+    const newTreeId = newTreeRow[0].tree_id;
+
+    // 5. Insert new Tree_Entry records for the new tree (FIX: Using child_tree_id)
+    for (const entry of updatedEntries) {
+        await client.query(
+            `INSERT INTO Tree_Entry (tree_id, name, mode, blob_id, child_tree_id)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [
+                newTreeId, 
+                entry.name, 
+                entry.mode, 
+                entry.mode === 'blob' ? entry.blob_id : null, 
+                entry.mode === 'tree' ? entry.linked_tree_id : null
+            ]
+        );
+    }
+
+    return newTreeId;
+}
+
+
+// ===============================================
+// NEW ROUTE: POST /repos/:repoId/delete-item
+// ===============================================
+
+router.post('/repos/:repoId/delete-item', async (req, res) => {
+    const { repoId } = req.params;
+    const { path: pathToDelete, message } = req.body;
+    const pathSegments = pathToDelete.split('/'); 
+    
+    const currentUserId = 1; // Placeholder for the committer's ID (should be auth-derived)
+
+    if (!pathToDelete || !message) {
+        return res.status(400).json({ error: 'Missing path or commit message.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 1. Get the latest commit and root tree ID
+        const { rows: latestCommitRows } = await client.query(
+            `SELECT
+                c.commit_id, c.tree_id
+             FROM Commit c
+             WHERE c.repo_id = $1
+             ORDER BY c.created_at DESC, c.commit_id DESC
+             LIMIT 1`,
+            [repoId]
+        );
+
+        if (latestCommitRows.length === 0) {
+             throw new Error('Repository is empty or not found. Cannot perform deletion.');
+        }
+
+        const latestCommit = latestCommitRows[0];
+        const currentRootTreeId = latestCommit.tree_id;
+
+        // 2. Rebuild the tree structure after deletion
+        const newRootTreeId = await rebuildTreeAfterDeletion(
+            client,
+            repoId,
+            currentRootTreeId,
+            pathSegments
+        );
+        
+        // Check if the deletion actually resulted in a change
+        if (newRootTreeId === currentRootTreeId) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'No change detected. The item may not exist or the operation resulted in an identical tree structure.' });
+        }
+
+        const commitContent = `${newRootTreeId}:${latestCommit.commit_id}:${message}:${currentUserId}:${Date.now()}`;
+        const commitHash = crypto.createHash('sha1').update(commitContent).digest('hex');
+
+        // 3. Create the new commit record
+        const { rows: newCommitRow } = await client.query(
+            `INSERT INTO Commit (repo_id, tree_id, hash, message, owner_id)
+             VALUES ($1, $2, $3, $4, $5) RETURNING commit_id`,
+            [repoId, newRootTreeId, commitHash, message, currentUserId]
+        );
+        const newCommitId = newCommitRow[0].commit_id;
+
+        // 4. Link the new commit to the old commit (its parent)
+        await client.query(
+            `INSERT INTO Commit_Parent (commit_id, parent_commit)
+             VALUES ($1, $2)`,
+            [newCommitId, latestCommit.commit_id]
+        );
+        
+        await client.query('COMMIT');
+        res.json({ success: true, commit_id: newCommitId, message: `Committed deletion of ${pathToDelete}` });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(`POST /repos/${repoId}/delete-item error:`, err);
+        // Handle Item not found error
+        if (err.message && (err.message.includes('Item not found') || err.message.includes('not a folder'))) {
+             return res.status(404).json({ error: err.message });
+        }
+        res.status(500).json({ error: 'Failed to create commit for deletion.' });
+    } finally {
+        client.release();
+    }
+});
+
+// ... rest of your routes ...
 module.exports = router;
+
