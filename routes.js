@@ -1087,4 +1087,69 @@ router.get('/repos/:repoId/search-commits', async (req, res) => {
 });
 
 
+// DELETE /repos/:repoId
+router.delete('/repos/:repoId', async (req, res) => {
+  const { repoId } = req.params;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // Call the procedure to delete repo + dependent DB rows.
+    // It RETURNS rows (deleted_content_path) for files to delete from disk.
+    const { rows } = await client.query('SELECT deleted_content_path FROM delete_repository_proc($1)', [repoId]);
+
+    await client.query('COMMIT');
+
+    // rows is an array of { deleted_content_path: '/path/to/file' }
+    // Delete each file; log failures but don't try to rollback DB (DB already committed).
+    const deletedPaths = rows.map(r => r.deleted_content_path).filter(Boolean);
+
+    for (const p of deletedPaths) {
+      try {
+        // Make sure path is resolved within your blobs directory
+        const safePath = path.resolve(__dirname, p);
+        const blobsDir = path.resolve(__dirname, 'blobs');
+
+        if (!safePath.startsWith(blobsDir)) {
+          console.warn('Skipping unsafe blob path:', safePath);
+          continue;
+        }
+
+        // remove file (if present)
+        await fs.remove(safePath);
+      } catch (fileErr) {
+        // Log but continue: DB is already committed. Consider alerting/monitoring.
+        console.error('Failed to remove blob file', p, fileErr);
+      }
+    }
+
+    // Finally, remove the repo's blobs folder if it exists (cleans leftover structure)
+    try {
+      const repoFolder = path.join(__dirname, 'blobs', String(repoId));
+      await fs.remove(repoFolder);
+    } catch (folderErr) {
+      console.error('Failed to remove repo blobs folder:', folderErr);
+    }
+
+    res.json({ success: true, deleted_files: deletedPaths.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('DELETE /repos error:', err);
+    if (err.code && err.code.startsWith('P')) {
+      // DB related error
+    }
+    // If the error was the repository not found (from the function exception),
+    // return 404 for clarity
+    if (err.message && err.message.includes('not found')) {
+      return res.status(404).json({ error: err.message });
+    }
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
 module.exports = router;
+
