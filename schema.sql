@@ -348,3 +348,16 @@ BEGIN
     WHERE w.mode = 'blob';
 END;
 $$ LANGUAGE plpgsql;
+
+-- ==========================================
+-- 8. ROLLBACK REQUESTS (Workflow)
+-- ==========================================
+
+CREATE TABLE IF NOT EXISTS Rollback_Request (
+    request_id SERIAL PRIMARY KEY,
+    repo_id INT REFERENCES REPOSITORY(repo_id) ON DELETE CASCADE,
+    commit_id INT REFERENCES Commit(commit_id), -- The commit they want to go back to
+    requester_id INT REFERENCES users(user_id),
+    status VARCHAR(20) DEFAULT 'Pending', -- Pending, Approved, Rejected
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

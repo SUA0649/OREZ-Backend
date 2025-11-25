@@ -714,11 +714,22 @@ router.get('/repos/:repoId/download', async (req, res) => {
 });
 
 // ---- NEW ENDPOINT: ROLLBACK TO A PREVIOUS COMMIT ----
+// ---- NEW ENDPOINT: ROLLBACK TO A PREVIOUS COMMIT (SECURED) ----
 router.post('/repos/:repoId/rollback/:commitId', async (req, res) => {
   const { repoId, commitId } = req.params;
   const { user_id } = req.body; // We need to know WHO is rolling back
 
   try {
+    // --- SECURITY CHECK: OWNER ONLY ---
+    // Use the helper function we already created
+    const permission = await getUserRepoPermission(repoId, user_id);
+    
+    if (permission !== 'Owner') {
+        console.log(`Blocked rollback attempt by user ${user_id} (Role: ${permission})`);
+        return res.status(403).json({ error: "Only Owners can perform a rollback." });
+    }
+    // ----------------------------------
+
     // 1. Generate a new hash for this "Revert" commit
     const newHash = crypto.randomBytes(20).toString('hex');
     const message = `Rollback to commit #${commitId}`;
@@ -927,6 +938,95 @@ async function getUserRepoPermission(repoId, userId) {
 
   return null; // Not linked
 }
+
+// ==================================================================
+// ROLLBACK REQUEST WORKFLOW (Contributor Request -> Owner Approve)
+// ==================================================================
+
+// 1. CREATE A ROLLBACK REQUEST (For Contributors)
+router.post('/repos/:repoId/rollback-request', async (req, res) => {
+  const { repoId } = req.params;
+  const { user_id, commit_id } = req.body;
+
+  try {
+    // Check permission (Must be at least Contributor)
+    const permission = await getUserRepoPermission(repoId, user_id);
+    if (!permission || permission === 'Viewer') {
+        return res.status(403).json({ error: "Viewers cannot request changes." });
+    }
+
+    await pool.query(
+      `INSERT INTO Rollback_Request (repo_id, commit_id, requester_id) VALUES ($1, $2, $3)`,
+      [repoId, commit_id, user_id]
+    );
+
+    res.json({ success: true, message: "Request sent to Owner." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. GET PENDING REQUESTS (For Owners to see)
+router.get('/repos/:repoId/rollback-requests', async (req, res) => {
+  const { repoId } = req.params;
+  try {
+    const { rows } = await pool.query(`
+      SELECT rr.request_id, rr.commit_id, rr.created_at, u.user_name, c.message as commit_message
+      FROM Rollback_Request rr
+      JOIN users u ON rr.requester_id = u.user_id
+      JOIN Commit c ON rr.commit_id = c.commit_id
+      WHERE rr.repo_id = $1 AND rr.status = 'Pending'
+      ORDER BY rr.created_at DESC
+    `, [repoId]);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. PROCESS REQUEST (Approve/Reject) - OWNER ONLY
+router.post('/repos/:repoId/rollback-requests/:requestId', async (req, res) => {
+  const { repoId, requestId } = req.params;
+  const { action, owner_id } = req.body; // action: 'approve' or 'reject'
+
+  try {
+    // Security Check
+    const permission = await getUserRepoPermission(repoId, owner_id);
+    if (permission !== 'Owner') return res.status(403).json({ error: "Only Owners can approve." });
+
+    if (action === 'reject') {
+        await pool.query(`DELETE FROM Rollback_Request WHERE request_id = $1`, [requestId]);
+        return res.json({ success: true, message: "Request rejected." });
+    }
+
+    if (action === 'approve') {
+        // 1. Get details from the request
+        const { rows: [reqData] } = await pool.query(
+            `SELECT commit_id FROM Rollback_Request WHERE request_id = $1`, 
+            [requestId]
+        );
+        if (!reqData) return res.status(404).json({ error: "Request not found" });
+
+        // 2. EXECUTE ROLLBACK (Call the Stored Procedure)
+        const newHash = crypto.randomBytes(20).toString('hex');
+        const message = `Rollback to commit #${reqData.commit_id} (Approved)`;
+        
+        await pool.query(
+            `CALL restore_commit_proc($1, $2, $3, $4, $5)`,
+            [repoId, owner_id, reqData.commit_id, newHash, message]
+        );
+
+        // 3. Delete the request (it's done)
+        await pool.query(`DELETE FROM Rollback_Request WHERE request_id = $1`, [requestId]);
+
+        return res.json({ success: true, message: "Rollback approved and executed." });
+    }
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ==================================================================
 // SEARCH & QUERY: FILTER COMMITS
