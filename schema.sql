@@ -392,18 +392,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_commit_activity_repo_day ON mv_commit_a
 
 -- Function to refresh the Materialized View
 CREATE OR REPLACE FUNCTION refresh_mv_commit_activity()
-RETURNS TRIGGER AS $$
+RETURNS VOID AS $$
 BEGIN
     REFRESH MATERIALIZED VIEW CONCURRENTLY mv_commit_activity;
-    RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
-
--- Trigger to refresh the view whenever a commit is inserted or deleted
-DROP TRIGGER IF EXISTS tr_refresh_mv_commit_activity ON Commit;
-CREATE TRIGGER tr_refresh_mv_commit_activity
-AFTER INSERT OR DELETE OR UPDATE ON Commit
-FOR EACH STATEMENT EXECUTE FUNCTION refresh_mv_commit_activity();
 
 -- 1. Get Daily Commit Counts (For Activity Graph) - NOW USING MV
 CREATE OR REPLACE FUNCTION get_commit_activity(p_repo_id INT)

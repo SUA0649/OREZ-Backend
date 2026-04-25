@@ -1459,5 +1459,18 @@ router.post('/repos/:repoId/delete-item', async (req, res) => {
 });
 
 // ... rest of your routes ...
+// ==================================================================
+// BACKGROUND JOB: REFRESH MATERIALIZED VIEW
+// Refreshes the analytics view every 5 minutes to keep read/write fast
+// ==================================================================
+setInterval(async () => {
+  try {
+    await pool.query('SELECT refresh_mv_commit_activity()');
+    console.log('[Background Job] Materialized View refreshed successfully.');
+  } catch (err) {
+    console.error('[Background Job] Error refreshing Materialized View:', err.message);
+  }
+}, 5 * 60 * 1000); // 5 minutes
+
 module.exports = router;
 

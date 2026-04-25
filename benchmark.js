@@ -101,7 +101,46 @@ async function runBenchmark() {
     const concEnd = Date.now();
     console.log(`- 100 parallel commit requests handled in: ${concEnd - concStart}ms\n`);
 
-    console.log("==================================================");
+    console.log("🚦 METRIC 4: ISOLATION CONFLICT TEST (SERIALIZABLE)");
+    console.log("--------------------------------------------------");
+    // To prove SERIALIZABLE works, we need two separate connections
+    const client1 = await pool.connect();
+    const client2 = await pool.connect();
+
+    try {
+      await client1.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      await client2.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+
+      // Both read the same state
+      await client1.query(`SELECT count(*) FROM Commit WHERE repo_id=${repoId}`);
+      await client2.query(`SELECT count(*) FROM Commit WHERE repo_id=${repoId}`);
+
+      // Both try to write based on that state
+      await client1.query(`INSERT INTO Commit (hash, repo_id, tree_id, owner_id, message) VALUES ('12345', ${repoId}, ${treeId}, ${userId}, 'Client 1 Update')`);
+      await client2.query(`INSERT INTO Commit (hash, repo_id, tree_id, owner_id, message) VALUES ('67890', ${repoId}, ${treeId}, ${userId}, 'Client 2 Update')`);
+
+      // In SERIALIZABLE isolation, the conflict is often detected at COMMIT time
+      await client1.query('COMMIT');
+      await client2.query('COMMIT');
+      
+      // If we reach this line, both commits succeeded (which means isolation failed)
+      console.log("❌ Test Failed: Both transactions succeeded (Isolation level might not be strict enough!)");
+    } catch (err) {
+      if (err.code === '40001') { // 40001 is the Postgres code for serialization_failure
+        console.log(`✅ Test Passed! Caught expected Serialization Error:`);
+        console.log(`   "${err.message}"`);
+        console.log(`   (This proves our concurrency handling successfully prevents Lost Updates!)`);
+      } else {
+        console.log(`❌ Unexpected error: ${err.message}`);
+      }
+      await client1.query('ROLLBACK');
+      await client2.query('ROLLBACK');
+    } finally {
+      client1.release();
+      client2.release();
+    }
+
+    console.log("\n==================================================");
     console.log("Benchmark run complete.");
     console.log("==================================================");
 
