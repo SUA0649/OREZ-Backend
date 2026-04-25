@@ -648,10 +648,13 @@ router.get('/repos/:repoId/blob/:hash', async (req, res) => {
 
 router.get('/repos/:repoId/commits', async (req, res) => {
   const { repoId } = req.params;
+  const limit = parseInt(req.query.limit) || 50;
+  const offset = parseInt(req.query.offset) || 0;
 
   try {
-    const { rows: commits } = await pool.query(
-      `SELECT
+    const { rows: commits } = await pool.query({
+      name: 'fetch-repo-commits-paginated',
+      text: `SELECT
          c.commit_id,
          c.tree_id,
          c.message,
@@ -660,9 +663,10 @@ router.get('/repos/:repoId/commits', async (req, res) => {
        FROM Commit c
        JOIN users u ON c.owner_id = u.user_id
        WHERE c.repo_id = $1
-       ORDER BY c.created_at DESC`,
-      [repoId]
-    );
+       ORDER BY c.created_at DESC
+       LIMIT $2 OFFSET $3`,
+      values: [repoId, limit, offset]
+    });
 
     res.json(commits);
 

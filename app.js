@@ -2,6 +2,7 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const compression = require('compression');
 
 //Import routes
 const apiRoutes = require('./routes');
@@ -9,6 +10,7 @@ const apiRoutes = require('./routes');
 const app = express();
 
 // Middleware
+app.use(compression()); // Compress all HTTP responses (Gzip)
 app.use(cors({ origin: 'http://localhost:3000' })); // Allow frontend
 app.use(express.json()); // Parse JSON request bodies
 app.use(express.urlencoded({ extended: true })); // Optional: parse URL-encoded bodies
