@@ -15,6 +15,29 @@ app.use(cors({ origin: 'http://localhost:3000' })); // Allow frontend
 app.use(express.json()); // Parse JSON request bodies
 app.use(express.urlencoded({ extended: true })); // Optional: parse URL-encoded bodies
 
+// --- Custom Request/Error Logger ---
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    const isError = res.statusCode >= 400;
+    
+    // Formatting for terminal readability
+    const statusColor = isError ? '\x1b[31m' : '\x1b[32m'; // Red for errors, Green for success
+    const resetColor = '\x1b[0m';
+    
+    const message = `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} -> ${statusColor}${res.statusCode}${resetColor} (${duration}ms)`;
+    
+    if (isError) {
+      console.error(`❌ ERROR: ${message}`);
+    } else {
+      console.log(`✅ OK: ${message}`);
+    }
+  });
+  next();
+});
+// -----------------------------------
+
 // Mount the routes from routes.js
 // All routes in routes.js will now be prefixed with /api
 app.use('/api', apiRoutes);
