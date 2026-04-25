@@ -7,7 +7,7 @@ const router = express.Router(); // Creating router instance
 const multer = require('multer');
 const fs = require('fs-extra');
 const path = require('path');
-const archiver = require('archiver'); 
+const archiver = require('archiver');
 const { Worker } = require('worker_threads');
 
 // --- BACKGROUND QUEUE STATE ---
@@ -22,11 +22,35 @@ const upload = multer({ storage });
 // --------------------------------
 
 
-// ---- Setting up database connection pool ----
-// Every subquery will use the below configuratoion to connect to the database
+// --- Phase 6: CQRS & Redis Caching ---
+const redis = require('redis');
+
+// Initialize Redis Client
+const redisClient = redis.createClient({
+  socket: {
+    host: 'localhost',
+    port: 6379
+  }
+});
+
+redisClient.connect().then(() => {
+  console.log('✅ Connected to Redis cache');
+}).catch(console.error);
+
+// Primary Database (Write Pool) - Handles all INSERT/UPDATE/DELETE
 const pool = new Pool({
   user: 'orez',
   host: 'localhost',
+  database: 'appdb',
+  password: '123',
+  port: 5432,
+});
+
+// Replica Database (Read Pool) - Handles SELECTs (CQRS Architecture)
+// In a true production environment, this points to a separate read-only DB instance.
+const readPool = new Pool({
+  user: 'orez',
+  host: 'localhost', // e.g., 'replica.postgres.internal'
   database: 'appdb',
   password: '123',
   port: 5432,
@@ -38,11 +62,11 @@ const pool = new Pool({
 
 // NEW ROUTE: Get recent commits across all repos a user is involved in
 router.get('/users/:userId/recent-commits', async (req, res) => {
-    const { userId } = req.params;
+  const { userId } = req.params;
 
-    try {
-        const { rows: commits } = await pool.query(
-            `SELECT
+  try {
+    const { rows: commits } = await pool.query(
+      `SELECT
                 c.commit_id,
                 r.name AS repo_name,
                 c.message,
@@ -61,15 +85,15 @@ router.get('/users/:userId/recent-commits', async (req, res) => {
             ORDER BY
                 c.created_at DESC
             LIMIT 3`,
-            [userId]
-        );
+      [userId]
+    );
 
-        res.json(commits);
+    res.json(commits);
 
-    } catch (err) {
-        console.error('GET /recent-commits error:', err);
-        res.status(500).json({ error: err.message });
-    }
+  } catch (err) {
+    console.error('GET /recent-commits error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Middleware: check if the requesting user can upload to the repo
@@ -98,32 +122,32 @@ async function checkUploadPermission(req, res, next) {
   }
 }
 // This just makes that /signup endpoint will make a post request, req and res means request and response
-router.post('/signup', async(req, res) =>{
-    //This is the json body that we get from the requst (frontend)
-    //Make sure when you parse it the variables are the same as what you send from frontend in .json
-    const { user_name, password } = req.body;
-    //Just hashing the password
-    const passwordHash = crypto.createHash('sha256').update(password).digest('hex');
+router.post('/signup', async (req, res) => {
+  //This is the json body that we get from the requst (frontend)
+  //Make sure when you parse it the variables are the same as what you send from frontend in .json
+  const { user_name, password } = req.body;
+  //Just hashing the password
+  const passwordHash = crypto.createHash('sha256').update(password).digest('hex');
 
-    //now insert
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
+  //now insert
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
 
-        const { rows: [user] } = await client.query(
-            //$1 = username, $2 = passwordHash
+    const { rows: [user] } = await client.query(
+      //$1 = username, $2 = passwordHash
       'INSERT INTO users (user_name, password_hash) VALUES ($1, $2) RETURNING user_id, user_name, created_at',
       [user_name, passwordHash]
     );
-        await client.query('COMMIT');
-        res.json(user);
-    } catch (err) {
-        await client.query('ROLLBACK');
-        //If error send http 400 error code with an error message
-        res.status(400).json({ error: err.message });
-    } finally {
-        client.release();
-    }
+    await client.query('COMMIT');
+    res.json(user);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    //If error send http 400 error code with an error message
+    res.status(400).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 
 });
 
@@ -148,20 +172,20 @@ router.post('/signin', async (req, res) => {
 
 //Now to get all repositories of a user, :userrId is a parameter sent in the url
 router.get('/repos/:userId', async (req, res) => {
-    //same idea as above we will now get instead of post
-    const { userId } = req.params;
-    try{
-     const { rows } = await pool.query(`
+  //same idea as above we will now get instead of post
+  const { userId } = req.params;
+  try {
+    const { rows } = await pool.query(`
     SELECT r.repo_id, r.name, r.description, rp.permission
     FROM repository r
     JOIN repopermission rp ON r.repo_id = rp.repo_id
     WHERE rp.user_id = $1
   `, [userId]);
-        res.json(rows);
-}
-    catch (err){
-        res.status(500).json({ error: err.message });
-    }
+    res.json(rows);
+  }
+  catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 
@@ -195,20 +219,20 @@ router.get('/repos/:repoId/collaborators', async (req, res) => {
 
 //Now to create a new repository
 router.post('/repos/create', async (req, res) => {
-  const { owner_id, name, description } = req.body;
-  try {
-    // Call the new stored function
-    const { rows: [repo] } = await pool.query(
-      `SELECT create_new_repository($1, $2, $3) as repo_id`,
-      [name, description, owner_id]
-    );
-    
-    // The function handles the repo, permission, and initial tree creation atomically
-    res.json({ repo_id: repo.repo_id }); // Return the newly created ID
+  const { owner_id, name, description } = req.body;
+  try {
+    // Call the new stored function
+    const { rows: [repo] } = await pool.query(
+      `SELECT create_new_repository($1, $2, $3) as repo_id`,
+      [name, description, owner_id]
+    );
 
-   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    // The function handles the repo, permission, and initial tree creation atomically
+    res.json({ repo_id: repo.repo_id }); // Return the newly created ID
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Add collaborator 
@@ -229,7 +253,7 @@ router.post('/repos/:repoId/collaborators', async (req, res) => {
   } catch (err) {
     console.error(err);
     if (err.message.includes('not found')) {
-        return res.status(404).json({ error: err.message });
+      return res.status(404).json({ error: err.message });
     }
     res.status(500).json({ error: err.message });
   }
@@ -266,7 +290,7 @@ async function processUploadedFilesAsFolder(repoId, files) {
     // --- Folder helper with logging ---
     async function ensureDirTree(repoId, client, rootTreeId, pathParts) {
       let curTreeId = rootTreeId;
-      
+
       for (const part of pathParts) {
         const existingChild = await client.query(
           `SELECT child_tree_id FROM tree_entry WHERE tree_id = $1 AND name = $2 AND mode = 'tree'`,
@@ -299,42 +323,42 @@ async function processUploadedFilesAsFolder(repoId, files) {
 
     // --- Process files with logging ---
     for (const file of files) {
-  // Normalize path: replace backslashes, remove leading/trailing slashes, collapse multiple slashes
-  let relPath = file.originalname.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/^\/|\/$/g, '');
-  
-  const parts = relPath.split('/').filter(p => p !== '');
-  if (parts.length === 0) continue;
+      // Normalize path: replace backslashes, remove leading/trailing slashes, collapse multiple slashes
+      let relPath = file.originalname.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/^\/|\/$/g, '');
 
-  const fileName = parts.pop(); // last part is file name
-  const dirParts = parts;       // remaining parts are folder path
+      const parts = relPath.split('/').filter(p => p !== '');
+      if (parts.length === 0) continue;
 
-  console.log(`Processing file '${fileName}' in path '${dirParts.join('/')}'`);
+      const fileName = parts.pop(); // last part is file name
+      const dirParts = parts;       // remaining parts are folder path
 
-  const parentTreeId = dirParts.length === 0 
-    ? rootTreeId 
-    : await ensureDirTree(repoId, client, rootTreeId, dirParts);
+      console.log(`Processing file '${fileName}' in path '${dirParts.join('/')}'`);
 
-  const hash = crypto.createHash('sha1').update(file.buffer).digest('hex');
-  const objectPath = await storeBlobFile(repoId, hash, file.buffer);
+      const parentTreeId = dirParts.length === 0
+        ? rootTreeId
+        : await ensureDirTree(repoId, client, rootTreeId, dirParts);
 
-  const blobRes = await client.query(
-    `INSERT INTO blob (hash, content_path, size) VALUES ($1, $2, $3)
+      const hash = crypto.createHash('sha1').update(file.buffer).digest('hex');
+      const objectPath = await storeBlobFile(repoId, hash, file.buffer);
+
+      const blobRes = await client.query(
+        `INSERT INTO blob (hash, content_path, size) VALUES ($1, $2, $3)
      ON CONFLICT (hash) DO NOTHING RETURNING blob_id`,
-    [hash, objectPath, file.size]
-  );
+        [hash, objectPath, file.size]
+      );
 
-  let blobId = blobRes.rows.length ? blobRes.rows[0].blob_id :
-               (await client.query('SELECT blob_id FROM blob WHERE hash=$1', [hash])).rows[0].blob_id;
+      let blobId = blobRes.rows.length ? blobRes.rows[0].blob_id :
+        (await client.query('SELECT blob_id FROM blob WHERE hash=$1', [hash])).rows[0].blob_id;
 
-  await client.query(
-    `INSERT INTO tree_entry (tree_id, name, mode, blob_id)
+      await client.query(
+        `INSERT INTO tree_entry (tree_id, name, mode, blob_id)
      VALUES ($1, $2, 'blob', $3)
      ON CONFLICT (tree_id, name) DO UPDATE SET blob_id = EXCLUDED.blob_id`,
-    [parentTreeId, fileName, blobId]
-  );
+        [parentTreeId, fileName, blobId]
+      );
 
-  console.log(`Added file '${fileName}' => blobId=${blobId} under treeId=${parentTreeId}`);
-}
+      console.log(`Added file '${fileName}' => blobId=${blobId} under treeId=${parentTreeId}`);
+    }
 
     await client.query('COMMIT');
     return rootTreeId;
@@ -349,7 +373,7 @@ async function processUploadedFilesAsFolder(repoId, files) {
 router.post('/repos/:repoId/upload-folder', upload.array('files'), checkUploadPermission, async (req, res) => {
   const { repoId } = req.params;
   const files = req.files;
-  
+
   // --- NEW: Get message and user ID from the form ---
   const { filePathsJson, uploaded_by, message } = req.body;
   const owner_id = uploaded_by; // 'uploaded_by' is the user.user_id
@@ -407,7 +431,7 @@ router.post('/repos/:repoId/upload-folder', upload.array('files'), checkUploadPe
     // --- HELPER: Recursive Copy-on-Write ---
     async function ensureDirTree(curTreeId, pathParts) {
       let currentId = curTreeId;
-      
+
       for (const part of pathParts) {
         // Find the child entry in the current tree
         const res = await client.query(
@@ -493,7 +517,7 @@ router.post('/repos/:repoId/upload-folder', upload.array('files'), checkUploadPe
          ON CONFLICT (hash) DO NOTHING RETURNING blob_id`,
         [hash, objectPath, file.size]
       );
-      
+
       let blobId;
       if (blobRes.rows.length > 0) {
         blobId = blobRes.rows[0].blob_id;
@@ -521,8 +545,10 @@ router.post('/repos/:repoId/upload-folder', upload.array('files'), checkUploadPe
       [commitHash, repoId, rootTreeId, owner_id, message || 'File upload']
     );
 
-    res.json({ success: true, root_tree_id: rootTreeId });
+    // --- Phase 6: Cache Invalidation ---
+    await redisClient.del(`repo_files_${repoId}`);
 
+    res.json({ success: true, root_tree_id: rootTreeId });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('upload-folder error:', err);
@@ -537,10 +563,20 @@ router.get('/repos/:repoId/files', async (req, res) => {
   const { repoId } = req.params;
 
   try {
+    // Phase 6: Check Redis Cache First
+    const cacheKey = `repo_files_${repoId}`;
+    const cachedData = await redisClient.get(cacheKey);
+    if (cachedData) {
+      console.log(`[Redis] Cache HIT for repo ${repoId}`);
+      return res.json(JSON.parse(cachedData));
+    }
+
+    console.log(`[Redis] Cache MISS for repo ${repoId}`);
+
     let rootTreeId = null;
 
-    // 1. Find the tree from the LATEST commit
-    const { rows: latestCommit } = await pool.query(
+    // 1. Find the tree from the LATEST commit (Using readPool)
+    const { rows: latestCommit } = await readPool.query(
       `SELECT tree_id FROM Commit 
        WHERE repo_id = $1 
        ORDER BY created_at DESC 
@@ -552,7 +588,7 @@ router.get('/repos/:repoId/files', async (req, res) => {
       rootTreeId = latestCommit[0].tree_id;
     } else {
       // Fallback for new/empty repos
-      const { rows: rootRows } = await pool.query(
+      const { rows: rootRows } = await readPool.query(
         `SELECT tree_id FROM tree WHERE repo_id=$1 ORDER BY tree_id LIMIT 1`,
         [repoId]
       );
@@ -563,9 +599,9 @@ router.get('/repos/:repoId/files', async (req, res) => {
       return res.json({ root_tree_id: null, entries: [] });
     }
 
-    // 2. CALL YOUR NEW SQL FUNCTION (Clean & Fast!)
-    const { rows: entries } = await pool.query(
-      `SELECT * FROM get_file_tree($1)`, 
+    // 2. CALL YOUR NEW SQL FUNCTION (Using readPool)
+    const { rows: entries } = await readPool.query(
+      `SELECT * FROM get_file_tree($1)`,
       [rootTreeId]
     );
 
@@ -578,7 +614,12 @@ router.get('/repos/:repoId/files', async (req, res) => {
       blob: e.mode === 'blob' ? { blob_id: e.blob_id, hash: e.blob_hash, size: e.blob_size } : null
     }));
 
-    res.json({ root_tree_id: rootTreeId, entries: formatted });
+    const responseData = { root_tree_id: rootTreeId, entries: formatted };
+
+    // Save to Redis (Cache for 1 hour)
+    await redisClient.setEx(cacheKey, 3600, JSON.stringify(responseData));
+
+    res.json(responseData);
 
   } catch (err) {
     console.error('GET files error:', err);
@@ -593,7 +634,7 @@ router.get('/repos/:repoId/tree/:treeId', async (req, res) => {
   try {
     // 1. CALL YOUR NEW SQL FUNCTION DIRECTLY
     const { rows: entries } = await pool.query(
-      `SELECT * FROM get_file_tree($1)`, 
+      `SELECT * FROM get_file_tree($1)`,
       [treeId]
     );
 
@@ -748,7 +789,7 @@ router.post('/repos/:repoId/download', async (req, res) => {
 router.get('/jobs/:jobId', (req, res) => {
   const job = downloadJobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
-  
+
   res.json({ status: job.status, error: job.error });
 });
 
@@ -758,7 +799,7 @@ router.get('/jobs/:jobId/download', (req, res) => {
   if (!job || job.status !== 'completed') {
     return res.status(400).json({ error: 'File not ready or job not found' });
   }
-  
+
   res.download(job.file, 'repository.zip', (err) => {
     if (err) console.error("Error sending zip:", err);
     // Cleanup the job and file after download
@@ -777,10 +818,10 @@ router.post('/repos/:repoId/rollback/:commitId', async (req, res) => {
     // --- SECURITY CHECK: OWNER ONLY ---
     // Use the helper function we already created
     const permission = await getUserRepoPermission(repoId, user_id);
-    
+
     if (permission !== 'Owner') {
-        console.log(`Blocked rollback attempt by user ${user_id} (Role: ${permission})`);
-        return res.status(403).json({ error: "Only Owners can perform a rollback." });
+      console.log(`Blocked rollback attempt by user ${user_id} (Role: ${permission})`);
+      return res.status(403).json({ error: "Only Owners can perform a rollback." });
     }
     // ----------------------------------
 
@@ -839,7 +880,7 @@ router.post('/repos/:repoId/collaborators/bulk', async (req, res) => {
 
         // -- Logic: Find User --
         const { rows: users } = await client.query(
-          'SELECT user_id FROM users WHERE user_name = $1', 
+          'SELECT user_id FROM users WHERE user_name = $1',
           [userName]
         );
 
@@ -869,7 +910,7 @@ router.post('/repos/:repoId/collaborators/bulk', async (req, res) => {
         // 5. ROLLBACK TO SAVEPOINT (TCL)
         // Undo ONLY this user's failure. The transaction continues!
         await client.query(`ROLLBACK TO SAVEPOINT ${savepointName}`);
-        
+
         console.log(`Skipping ${userName}: ${innerErr.message}`);
         results.failed.push({ user: userName, reason: innerErr.message });
       }
@@ -879,10 +920,10 @@ router.post('/repos/:repoId/collaborators/bulk', async (req, res) => {
     // Permanently save all successful operations
     await client.query('COMMIT');
 
-    res.json({ 
-      success: true, 
-      message: "Bulk process complete", 
-      results 
+    res.json({
+      success: true,
+      message: "Bulk process complete",
+      results
     });
 
   } catch (err) {
@@ -921,10 +962,10 @@ router.get('/repos/:repoId/diff/:commitId', async (req, res) => {
     // 3. Helper to flatten a tree into a simple map: { "path/to/file": "hash" }
     async function getFlatFileMap(treeId) {
       if (!treeId) return {};
-      
+
       // CALL THE NEW SQL FUNCTION (get_diff_manifest)
       const { rows } = await pool.query(`SELECT * FROM get_diff_manifest($1)`, [treeId]);
-      
+
       const map = {};
       rows.forEach(r => {
         // Key by the FULL PATH (e.g. "src/components/App.js")
@@ -997,7 +1038,7 @@ router.post('/repos/:repoId/rollback-request', async (req, res) => {
     // Check permission (Must be at least Contributor)
     const permission = await getUserRepoPermission(repoId, user_id);
     if (!permission || permission === 'Viewer') {
-        return res.status(403).json({ error: "Viewers cannot request changes." });
+      return res.status(403).json({ error: "Viewers cannot request changes." });
     }
 
     await pool.query(
@@ -1040,31 +1081,31 @@ router.post('/repos/:repoId/rollback-requests/:requestId', async (req, res) => {
     if (permission !== 'Owner') return res.status(403).json({ error: "Only Owners can approve." });
 
     if (action === 'reject') {
-        await pool.query(`DELETE FROM Rollback_Request WHERE request_id = $1`, [requestId]);
-        return res.json({ success: true, message: "Request rejected." });
+      await pool.query(`DELETE FROM Rollback_Request WHERE request_id = $1`, [requestId]);
+      return res.json({ success: true, message: "Request rejected." });
     }
 
     if (action === 'approve') {
-        // 1. Get details from the request
-        const { rows: [reqData] } = await pool.query(
-            `SELECT commit_id FROM Rollback_Request WHERE request_id = $1`, 
-            [requestId]
-        );
-        if (!reqData) return res.status(404).json({ error: "Request not found" });
+      // 1. Get details from the request
+      const { rows: [reqData] } = await pool.query(
+        `SELECT commit_id FROM Rollback_Request WHERE request_id = $1`,
+        [requestId]
+      );
+      if (!reqData) return res.status(404).json({ error: "Request not found" });
 
-        // 2. EXECUTE ROLLBACK (Call the Stored Procedure)
-        const newHash = crypto.randomBytes(20).toString('hex');
-        const message = `Rollback to commit #${reqData.commit_id} (Approved)`;
-        
-        await pool.query(
-            `CALL restore_commit_proc($1, $2, $3, $4, $5)`,
-            [repoId, owner_id, reqData.commit_id, newHash, message]
-        );
+      // 2. EXECUTE ROLLBACK (Call the Stored Procedure)
+      const newHash = crypto.randomBytes(20).toString('hex');
+      const message = `Rollback to commit #${reqData.commit_id} (Approved)`;
 
-        // 3. Delete the request (it's done)
-        await pool.query(`DELETE FROM Rollback_Request WHERE request_id = $1`, [requestId]);
+      await pool.query(
+        `CALL restore_commit_proc($1, $2, $3, $4, $5)`,
+        [repoId, owner_id, reqData.commit_id, newHash, message]
+      );
 
-        return res.json({ success: true, message: "Rollback approved and executed." });
+      // 3. Delete the request (it's done)
+      await pool.query(`DELETE FROM Rollback_Request WHERE request_id = $1`, [requestId]);
+
+      return res.json({ success: true, message: "Rollback approved and executed." });
     }
 
   } catch (err) {
@@ -1093,7 +1134,7 @@ router.get('/repos/:repoId/search-commits', async (req, res) => {
       JOIN users u ON c.owner_id = u.user_id
       WHERE c.repo_id = $1
     `;
-    
+
     const queryParams = [repoId];
     let paramIndex = 2; // Start at $2 because $1 is repoId
 
@@ -1113,7 +1154,7 @@ router.get('/repos/:repoId/search-commits', async (req, res) => {
 
     if (endDate) {
       // Add 1 day to include the full end date
-      queryText += ` AND c.created_at <= $${paramIndex}::date + 1`; 
+      queryText += ` AND c.created_at <= $${paramIndex}::date + 1`;
       queryParams.push(endDate);
       paramIndex++;
     }
@@ -1152,7 +1193,7 @@ router.get('/repos/:repoId/analytics', async (req, res) => {
     const { rows: commits } = await pool.query(
       `SELECT c.message, c.created_at, u.user_name 
        FROM Commit c JOIN users u ON c.owner_id = u.user_id
-       WHERE c.repo_id = $1 ORDER BY c.created_at ASC`, 
+       WHERE c.repo_id = $1 ORDER BY c.created_at ASC`,
       [repoId]
     );
 
@@ -1169,17 +1210,17 @@ router.get('/repos/:repoId/analytics', async (req, res) => {
 
     // 3. Get Code Clones (Type 1)
     const { rows: [latest] } = await pool.query(
-        `SELECT tree_id FROM Commit WHERE repo_id = $1 ORDER BY created_at DESC LIMIT 1`,
-        [repoId]
+      `SELECT tree_id FROM Commit WHERE repo_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [repoId]
     );
-    
+
     let clones = [];
     if (latest) {
-        const { rows: cloneRows } = await pool.query(
-            `SELECT * FROM get_code_clones($1)`, 
-            [latest.tree_id]
-        );
-        clones = cloneRows;
+      const { rows: cloneRows } = await pool.query(
+        `SELECT * FROM get_code_clones($1)`,
+        [latest.tree_id]
+      );
+      clones = cloneRows;
     }
 
     res.json({
@@ -1282,98 +1323,98 @@ router.delete('/repos/:repoId', async (req, res) => {
  * @throws {Error} - If the item to delete is not found or is a file in the middle of a path.
  */
 async function rebuildTreeAfterDeletion(client, repoId, currentTreeId, pathSegments) {
-    const segmentName = pathSegments[0];
-    const isTarget = pathSegments.length === 1;
+  const segmentName = pathSegments[0];
+  const isTarget = pathSegments.length === 1;
 
-    // 1. Fetch all entries of the current tree (FIX: Using child_tree_id)
-    const { rows: entries } = await client.query(
-        `SELECT
+  // 1. Fetch all entries of the current tree (FIX: Using child_tree_id)
+  const { rows: entries } = await client.query(
+    `SELECT
             te.name, te.mode, te.blob_id, te.child_tree_id AS linked_tree_id
          FROM Tree_Entry te
          WHERE te.tree_id = $1
          ORDER BY te.name`,
-        [currentTreeId]
-    );
+    [currentTreeId]
+  );
 
-    // Filter out the entry to be deleted if we are at the target level
-    let updatedEntries = entries.filter(entry => entry.name !== segmentName);
+  // Filter out the entry to be deleted if we are at the target level
+  let updatedEntries = entries.filter(entry => entry.name !== segmentName);
 
-    // Find the entry that corresponds to the current segment
-    const targetEntry = entries.find(entry => entry.name === segmentName);
+  // Find the entry that corresponds to the current segment
+  const targetEntry = entries.find(entry => entry.name === segmentName);
 
-    if (!targetEntry) {
-        throw new Error(`Item not found: ${pathSegments.join('/')}`);
+  if (!targetEntry) {
+    throw new Error(`Item not found: ${pathSegments.join('/')}`);
+  }
+
+  if (!isTarget) {
+    // Case 2: The item is deeper in the structure (target is a subdirectory).
+    if (targetEntry.mode !== 'tree' || !targetEntry.linked_tree_id) {
+      throw new Error(`Path segment '${segmentName}' is not a folder, but expected a folder for path traversal.`);
     }
 
-    if (!isTarget) {
-        // Case 2: The item is deeper in the structure (target is a subdirectory).
-        if (targetEntry.mode !== 'tree' || !targetEntry.linked_tree_id) {
-             throw new Error(`Path segment '${segmentName}' is not a folder, but expected a folder for path traversal.`);
-        }
-
-        // Recursively call for the next level
-        const newSubTreeId = await rebuildTreeAfterDeletion(
-            client,
-            repoId,
-            targetEntry.linked_tree_id,
-            pathSegments.slice(1) // Pass the rest of the path
-        );
-
-        // Create a new entry pointing to the new subtree
-        const newTargetEntry = {
-            name: targetEntry.name,
-            mode: targetEntry.mode, // 'tree'
-            blob_id: null,
-            linked_tree_id: newSubTreeId
-        };
-        
-        // Add the updated entry back into the list
-        updatedEntries.push(newTargetEntry);
-        updatedEntries.sort((a, b) => a.name.localeCompare(b.name));
-    }
-    
-    // 2. Calculate the hash of the new tree's content
-    const treeContent = updatedEntries.map(entry =>
-        `${entry.mode}:${entry.linked_tree_id || entry.blob_id}:${entry.name}`
-    ).join('\n');
-    
-    // Assuming crypto is available via `const crypto = require('crypto');`
-    const newTreeHash = crypto.createHash('sha1').update(treeContent).digest('hex');
-
-    // 3. Check for existing tree with this hash (Content-addressability)
-    const { rows: existingTree } = await client.query(
-        `SELECT tree_id FROM Tree WHERE repo_id = $1 AND hash = $2`,
-        [repoId, newTreeHash]
+    // Recursively call for the next level
+    const newSubTreeId = await rebuildTreeAfterDeletion(
+      client,
+      repoId,
+      targetEntry.linked_tree_id,
+      pathSegments.slice(1) // Pass the rest of the path
     );
 
-    if (existingTree.length > 0) {
-        // Tree content is identical to an existing tree, reuse its ID
-        return existingTree[0].tree_id;
-    }
+    // Create a new entry pointing to the new subtree
+    const newTargetEntry = {
+      name: targetEntry.name,
+      mode: targetEntry.mode, // 'tree'
+      blob_id: null,
+      linked_tree_id: newSubTreeId
+    };
 
-    // 4. Insert the new Tree record
-    const { rows: newTreeRow } = await client.query(
-        `INSERT INTO Tree (repo_id, hash) VALUES ($1, $2) RETURNING tree_id`,
-        [repoId, newTreeHash]
-    );
-    const newTreeId = newTreeRow[0].tree_id;
+    // Add the updated entry back into the list
+    updatedEntries.push(newTargetEntry);
+    updatedEntries.sort((a, b) => a.name.localeCompare(b.name));
+  }
 
-    // 5. Insert new Tree_Entry records for the new tree (FIX: Using child_tree_id)
-    for (const entry of updatedEntries) {
-        await client.query(
-            `INSERT INTO Tree_Entry (tree_id, name, mode, blob_id, child_tree_id)
+  // 2. Calculate the hash of the new tree's content
+  const treeContent = updatedEntries.map(entry =>
+    `${entry.mode}:${entry.linked_tree_id || entry.blob_id}:${entry.name}`
+  ).join('\n');
+
+  // Assuming crypto is available via `const crypto = require('crypto');`
+  const newTreeHash = crypto.createHash('sha1').update(treeContent).digest('hex');
+
+  // 3. Check for existing tree with this hash (Content-addressability)
+  const { rows: existingTree } = await client.query(
+    `SELECT tree_id FROM Tree WHERE repo_id = $1 AND hash = $2`,
+    [repoId, newTreeHash]
+  );
+
+  if (existingTree.length > 0) {
+    // Tree content is identical to an existing tree, reuse its ID
+    return existingTree[0].tree_id;
+  }
+
+  // 4. Insert the new Tree record
+  const { rows: newTreeRow } = await client.query(
+    `INSERT INTO Tree (repo_id, hash) VALUES ($1, $2) RETURNING tree_id`,
+    [repoId, newTreeHash]
+  );
+  const newTreeId = newTreeRow[0].tree_id;
+
+  // 5. Insert new Tree_Entry records for the new tree (FIX: Using child_tree_id)
+  for (const entry of updatedEntries) {
+    await client.query(
+      `INSERT INTO Tree_Entry (tree_id, name, mode, blob_id, child_tree_id)
              VALUES ($1, $2, $3, $4, $5)`,
-            [
-                newTreeId, 
-                entry.name, 
-                entry.mode, 
-                entry.mode === 'blob' ? entry.blob_id : null, 
-                entry.mode === 'tree' ? entry.linked_tree_id : null
-            ]
-        );
-    }
+      [
+        newTreeId,
+        entry.name,
+        entry.mode,
+        entry.mode === 'blob' ? entry.blob_id : null,
+        entry.mode === 'tree' ? entry.linked_tree_id : null
+      ]
+    );
+  }
 
-    return newTreeId;
+  return newTreeId;
 }
 
 
@@ -1382,84 +1423,88 @@ async function rebuildTreeAfterDeletion(client, repoId, currentTreeId, pathSegme
 // ===============================================
 
 router.post('/repos/:repoId/delete-item', async (req, res) => {
-    const { repoId } = req.params;
-    const { path: pathToDelete, message } = req.body;
-    const pathSegments = pathToDelete.split('/'); 
-    
-    const currentUserId = 1; // Placeholder for the committer's ID (should be auth-derived)
+  const { repoId } = req.params;
+  const { path: pathToDelete, message } = req.body;
+  const pathSegments = pathToDelete.split('/');
 
-    if (!pathToDelete || !message) {
-        return res.status(400).json({ error: 'Missing path or commit message.' });
-    }
+  const currentUserId = 1; // Placeholder for the committer's ID (should be auth-derived)
 
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
+  if (!pathToDelete || !message) {
+    return res.status(400).json({ error: 'Missing path or commit message.' });
+  }
 
-        // 1. Get the latest commit and root tree ID
-        const { rows: latestCommitRows } = await client.query(
-            `SELECT
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Get the latest commit and root tree ID
+    const { rows: latestCommitRows } = await client.query(
+      `SELECT
                 c.commit_id, c.tree_id
              FROM Commit c
              WHERE c.repo_id = $1
              ORDER BY c.created_at DESC, c.commit_id DESC
              LIMIT 1`,
-            [repoId]
-        );
+      [repoId]
+    );
 
-        if (latestCommitRows.length === 0) {
-             throw new Error('Repository is empty or not found. Cannot perform deletion.');
-        }
-
-        const latestCommit = latestCommitRows[0];
-        const currentRootTreeId = latestCommit.tree_id;
-
-        // 2. Rebuild the tree structure after deletion
-        const newRootTreeId = await rebuildTreeAfterDeletion(
-            client,
-            repoId,
-            currentRootTreeId,
-            pathSegments
-        );
-        
-        // Check if the deletion actually resulted in a change
-        if (newRootTreeId === currentRootTreeId) {
-            await client.query('ROLLBACK');
-            return res.status(409).json({ error: 'No change detected. The item may not exist or the operation resulted in an identical tree structure.' });
-        }
-
-        const commitContent = `${newRootTreeId}:${latestCommit.commit_id}:${message}:${currentUserId}:${Date.now()}`;
-        const commitHash = crypto.createHash('sha1').update(commitContent).digest('hex');
-
-        // 3. Create the new commit record
-        const { rows: newCommitRow } = await client.query(
-            `INSERT INTO Commit (repo_id, tree_id, hash, message, owner_id)
-             VALUES ($1, $2, $3, $4, $5) RETURNING commit_id`,
-            [repoId, newRootTreeId, commitHash, message, currentUserId]
-        );
-        const newCommitId = newCommitRow[0].commit_id;
-
-        // 4. Link the new commit to the old commit (its parent)
-        await client.query(
-            `INSERT INTO Commit_Parent (commit_id, parent_commit)
-             VALUES ($1, $2)`,
-            [newCommitId, latestCommit.commit_id]
-        );
-        
-        await client.query('COMMIT');
-        res.json({ success: true, commit_id: newCommitId, message: `Committed deletion of ${pathToDelete}` });
-
-    } catch (err) {
-        await client.query('ROLLBACK');
-        console.error(`POST /repos/${repoId}/delete-item error:`, err);
-        // Handle Item not found error
-        if (err.message && (err.message.includes('Item not found') || err.message.includes('not a folder'))) {
-             return res.status(404).json({ error: err.message });
-        }
-        res.status(500).json({ error: 'Failed to create commit for deletion.' });
-    } finally {
-        client.release();
+    if (latestCommitRows.length === 0) {
+      throw new Error('Repository is empty or not found. Cannot perform deletion.');
     }
+
+    const latestCommit = latestCommitRows[0];
+    const currentRootTreeId = latestCommit.tree_id;
+
+    // 2. Rebuild the tree structure after deletion
+    const newRootTreeId = await rebuildTreeAfterDeletion(
+      client,
+      repoId,
+      currentRootTreeId,
+      pathSegments
+    );
+
+    // Check if the deletion actually resulted in a change
+    if (newRootTreeId === currentRootTreeId) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'No change detected. The item may not exist or the operation resulted in an identical tree structure.' });
+    }
+
+    const commitContent = `${newRootTreeId}:${latestCommit.commit_id}:${message}:${currentUserId}:${Date.now()}`;
+    const commitHash = crypto.createHash('sha1').update(commitContent).digest('hex');
+
+    // 3. Create the new commit record
+    const { rows: newCommitRow } = await client.query(
+      `INSERT INTO Commit (repo_id, tree_id, hash, message, owner_id)
+             VALUES ($1, $2, $3, $4, $5) RETURNING commit_id`,
+      [repoId, newRootTreeId, commitHash, message, currentUserId]
+    );
+    const newCommitId = newCommitRow[0].commit_id;
+
+    // 4. Link the new commit to the old commit (its parent)
+    await client.query(
+      `INSERT INTO Commit_Parent (commit_id, parent_commit)
+             VALUES ($1, $2)`,
+      [newCommitId, latestCommit.commit_id]
+    );
+
+    await client.query('COMMIT');
+
+    // --- Phase 6: Cache Invalidation ---
+    await redisClient.del(`repo_files_${repoId}`);
+
+    res.json({ success: true, commit_id: newCommitId, message: `Committed deletion of ${pathToDelete}` });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(`POST /repos/${repoId}/delete-item error:`, err);
+    // Handle Item not found error
+    if (err.message && (err.message.includes('Item not found') || err.message.includes('not a folder'))) {
+      return res.status(404).json({ error: err.message });
+    }
+    res.status(500).json({ error: 'Failed to create commit for deletion.' });
+  } finally {
+    client.release();
+  }
 });
 
 // ... rest of your routes ...
