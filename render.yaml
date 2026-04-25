@@ -15,11 +15,11 @@ services:
           name: orez-redis
           property: connectionString
 
+  - type: redis
+    name: orez-redis
+    plan: free
+
 databases:
   - name: orez-db
     databaseName: appdb
     user: orez
-
-redis:
-  - name: orez-redis
-    plan: free
