@@ -67,6 +67,19 @@ const readPoolConfig = process.env.DATABASE_URL
 const readPool = new Pool(readPoolConfig);
 // ----------------------------------------------
 
+// TEMPORARY CLOUD DB INITIALIZATION ROUTE
+const fs = require('fs');
+router.get('/init-cloud-db', async (req, res) => {
+  try {
+    const schema = fs.readFileSync('./schema.sql', 'utf8');
+    await pool.query(schema);
+    res.json({ message: "✅ Cloud Database initialized successfully!" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+// ----------------------------------------------
+
 
 // ... existing routes ...
 
