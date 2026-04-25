@@ -8,6 +8,12 @@ const multer = require('multer');
 const fs = require('fs-extra');
 const path = require('path');
 const archiver = require('archiver'); 
+const { Worker } = require('worker_threads');
+
+// --- BACKGROUND QUEUE STATE ---
+const downloadJobs = new Map();
+// ------------------------------
+
 // ----------------------------
 
 // ---- Multer (memory) setup ----
@@ -127,7 +133,7 @@ router.post('/signin', async (req, res) => {
 
   try {
     const { rows: [user] } = await pool.query(
-      'SELECT * FROM users WHERE user_name=$1',
+      'SELECT user_id, user_name, password_hash FROM users WHERE user_name=$1',
       [user_name]
     );
 
@@ -365,6 +371,7 @@ router.post('/repos/:repoId/upload-folder', upload.array('files'), checkUploadPe
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    await client.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
 
     // 1. Find the Old Root (from previous commit)
     const { rows: latest } = await client.query(
@@ -666,11 +673,10 @@ router.get('/repos/:repoId/commits', async (req, res) => {
 });
 
 
-router.get('/repos/:repoId/download', async (req, res) => {
+router.post('/repos/:repoId/download', async (req, res) => {
   const { repoId } = req.params;
 
   try {
-    // Get root tree
     const { rows: [rootTree] } = await pool.query(
       `SELECT tree_id FROM tree WHERE repo_id=$1 ORDER BY tree_id LIMIT 1`,
       [repoId]
@@ -678,39 +684,83 @@ router.get('/repos/:repoId/download', async (req, res) => {
     if (!rootTree) return res.status(404).json({ error: 'Repo not found' });
     const rootTreeId = rootTree.tree_id;
 
-    res.setHeader("Content-Disposition", `attachment; filename=repo-${repoId}.zip`);
-    res.setHeader("Content-Type", "application/zip");
+    // 1. Generate a Job ID and set status to processing
+    const jobId = crypto.randomBytes(8).toString('hex');
+    const zipPath = path.join(__dirname, 'repo_storage', 'zips', `${jobId}.zip`);
+    await fs.ensureDir(path.dirname(zipPath));
 
-    const archive = archiver("zip", { zlib: { level: 9 } });
-    archive.on("error", (err) => res.status(500).send({ error: err.message }));
-    archive.pipe(res);
+    downloadJobs.set(jobId, { status: 'processing', error: null, file: zipPath });
 
-    // Recursive function to add files/folders
-    async function addTree(treeId, currentPath = "") {
-      const { rows: entries } = await pool.query(
-        `SELECT te.name, te.mode, te.child_tree_id, b.content_path AS blob_path
-         FROM tree_entry te
-         LEFT JOIN blob b ON te.blob_id = b.blob_id
-         WHERE te.tree_id=$1`,
-        [treeId]
-      );
+    // 2. Respond immediately to the frontend
+    res.json({ success: true, job_id: jobId, message: 'Compression started in background' });
 
-      for (const e of entries) {
-        if (e.mode === "tree") {
-          await addTree(e.child_tree_id, path.join(currentPath, e.name));
-        } else if (e.mode === "blob") {
-          archive.file(e.blob_path, { name: path.join(currentPath, e.name) });
+    // 3. Perform compression asynchronously (Background Queue simulation)
+    setImmediate(async () => {
+      try {
+        const output = fs.createWriteStream(zipPath);
+        const archive = archiver("zip", { zlib: { level: 9 } });
+
+        archive.pipe(output);
+
+        async function addTree(treeId, currentPath = "") {
+          const { rows: entries } = await pool.query(
+            `SELECT te.name, te.mode, te.child_tree_id, b.content_path AS blob_path
+             FROM tree_entry te
+             LEFT JOIN blob b ON te.blob_id = b.blob_id
+             WHERE te.tree_id=$1`,
+            [treeId]
+          );
+
+          for (const e of entries) {
+            if (e.mode === "tree") {
+              await addTree(e.child_tree_id, path.join(currentPath, e.name));
+            } else if (e.mode === "blob") {
+              archive.file(e.blob_path, { name: path.join(currentPath, e.name) });
+            }
+          }
         }
-      }
-    }
 
-    await addTree(rootTreeId);
-    archive.finalize();
+        await addTree(rootTreeId);
+        await archive.finalize();
+
+        // When done, mark job as complete
+        output.on('close', () => {
+          downloadJobs.set(jobId, { status: 'completed', file: zipPath });
+        });
+
+      } catch (err) {
+        console.error("Background Zipping Error:", err);
+        downloadJobs.set(jobId, { status: 'failed', error: err.message });
+      }
+    });
 
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// POLLING ENDPOINT: Check status of download job
+router.get('/jobs/:jobId', (req, res) => {
+  const job = downloadJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  
+  res.json({ status: job.status, error: job.error });
+});
+
+// FETCH FILE: Download the generated zip once complete
+router.get('/jobs/:jobId/download', (req, res) => {
+  const job = downloadJobs.get(req.params.jobId);
+  if (!job || job.status !== 'completed') {
+    return res.status(400).json({ error: 'File not ready or job not found' });
+  }
+  
+  res.download(job.file, 'repository.zip', (err) => {
+    if (err) console.error("Error sending zip:", err);
+    // Cleanup the job and file after download
+    fs.remove(job.file).catch(console.error);
+    downloadJobs.delete(req.params.jobId);
+  });
 });
 
 // ---- NEW ENDPOINT: ROLLBACK TO A PREVIOUS COMMIT ----
@@ -883,31 +933,22 @@ router.get('/repos/:repoId/diff/:commitId', async (req, res) => {
     const currentFiles = await getFlatFileMap(current.tree_id);
     const parentFiles = await getFlatFileMap(parent ? parent.tree_id : null);
 
-    // 5. Compare them (The Diff Logic)
-    const changes = [];
+    // 5. Compare them using a Worker Thread (Multithreading)
+    const worker = new Worker(path.join(__dirname, 'diffWorker.js'), {
+      workerData: { currentFiles, parentFiles }
+    });
 
-    // Check for Modified and Added
-    for (const [name, file] of Object.entries(currentFiles)) {
-      const oldFile = parentFiles[name];
-      
-      if (!oldFile) {
-        changes.push({ type: 'added', name, newHash: file.hash, oldHash: null });
-      } else if (oldFile.hash !== file.hash) {
-        changes.push({ type: 'modified', name, newHash: file.hash, oldHash: oldFile.hash });
+    worker.on('message', (result) => {
+      if (result.success) {
+        res.json({ parent_found: !!parent, changes: result.changes });
+      } else {
+        res.status(500).json({ error: result.error });
       }
-      // If hashes match, it's 'unchanged', so we skip it.
-    }
+    });
 
-    // Check for Deleted
-    for (const [name, file] of Object.entries(parentFiles)) {
-      if (!currentFiles[name]) {
-        changes.push({ type: 'deleted', name, newHash: null, oldHash: file.hash });
-      }
-    }
-
-    res.json({ 
-      parent_found: !!parent,
-      changes 
+    worker.on('error', (error) => {
+      console.error('Worker error:', error);
+      res.status(500).json({ error: 'Diff computation failed' });
     });
 
   } catch (err) {

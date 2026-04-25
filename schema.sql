@@ -76,6 +76,21 @@ CREATE TABLE IF NOT EXISTS Commit_Parent(
     parent_commit int references Commit(commit_id)
 );
 
+-- ==========================================
+-- 1.5 INDEXES (Phase 1 Optimization)
+-- ==========================================
+
+-- B-Tree Indexes for heavily queried foreign keys (Optimizes sorting & range queries)
+CREATE INDEX IF NOT EXISTS idx_commit_repo_id ON Commit USING btree(repo_id);
+CREATE INDEX IF NOT EXISTS idx_repo_owner_id ON REPOSITORY USING btree(owner_id);
+CREATE INDEX IF NOT EXISTS idx_repoperm_repo_id ON RepoPermission USING btree(repo_id);
+CREATE INDEX IF NOT EXISTS idx_tree_repo_id ON Tree USING btree(repo_id);
+
+-- Hash Indexes for strict equality lookups (O(1) lookups)
+CREATE INDEX IF NOT EXISTS idx_tree_entry_tree_id ON Tree_Entry USING hash(tree_id);
+CREATE INDEX IF NOT EXISTS idx_tree_entry_blob_id ON Tree_Entry USING hash(blob_id);
+CREATE INDEX IF NOT EXISTS idx_tree_entry_child_tree ON Tree_Entry USING hash(child_tree_id);
+
 -- New Table: Audit Log for tracking security changes
 CREATE TABLE IF NOT EXISTS audit_log (
     log_id SERIAL PRIMARY KEY,
@@ -366,7 +381,31 @@ CREATE TABLE IF NOT EXISTS Rollback_Request (
 -- 9. ANALYTICS MODULE
 -- ==========================================
 
--- 1. Get Daily Commit Counts (For Activity Graph)
+-- Materialized View for Commit Analytics
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_commit_activity AS 
+SELECT DATE(created_at) as day, repo_id, COUNT(*) as cnt
+FROM Commit 
+GROUP BY DATE(created_at), repo_id;
+
+-- Index for the materialized view to speed up filtering
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_commit_activity_repo_day ON mv_commit_activity (repo_id, day);
+
+-- Function to refresh the Materialized View
+CREATE OR REPLACE FUNCTION refresh_mv_commit_activity()
+RETURNS TRIGGER AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW CONCURRENTLY mv_commit_activity;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Trigger to refresh the view whenever a commit is inserted or deleted
+DROP TRIGGER IF EXISTS tr_refresh_mv_commit_activity ON Commit;
+CREATE TRIGGER tr_refresh_mv_commit_activity
+AFTER INSERT OR DELETE OR UPDATE ON Commit
+FOR EACH STATEMENT EXECUTE FUNCTION refresh_mv_commit_activity();
+
+-- 1. Get Daily Commit Counts (For Activity Graph) - NOW USING MV
 CREATE OR REPLACE FUNCTION get_commit_activity(p_repo_id INT)
 RETURNS TABLE (
     commit_date DATE,
@@ -375,11 +414,10 @@ RETURNS TABLE (
 BEGIN
     RETURN QUERY
     SELECT 
-        DATE(created_at) as day, 
-        COUNT(*) as cnt
-    FROM Commit 
+        day as commit_date, 
+        cnt as commit_count
+    FROM mv_commit_activity 
     WHERE repo_id = p_repo_id
-    GROUP BY DATE(created_at)
     ORDER BY day ASC;
 END;
 $$ LANGUAGE plpgsql;
