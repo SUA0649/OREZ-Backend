@@ -1,6 +1,7 @@
 services:
   - type: web
     name: orez-backend
+    plan: free
     env: node
     buildCommand: npm install
     startCommand: npm start
@@ -24,3 +25,4 @@ databases:
   - name: orez-db
     databaseName: appdb
     user: orez
+    plan: free
