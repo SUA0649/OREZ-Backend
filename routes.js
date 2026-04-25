@@ -29,11 +29,11 @@ const redis = require('redis');
 const redisClient = process.env.REDIS_URL
   ? redis.createClient({ url: process.env.REDIS_URL })
   : redis.createClient({
-      socket: {
-        host: 'localhost',
-        port: 6379
-      }
-    });
+    socket: {
+      host: 'localhost',
+      port: 6379
+    }
+  });
 
 redisClient.connect().then(() => {
   console.log('✅ Connected to Redis cache');
@@ -42,12 +42,12 @@ redisClient.connect().then(() => {
 const poolConfig = process.env.DATABASE_URL
   ? { connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } }
   : {
-      user: 'orez',
-      host: 'localhost',
-      database: 'appdb',
-      password: '123',
-      port: 5432,
-    };
+    user: 'orez',
+    host: 'localhost',
+    database: 'appdb',
+    password: '123',
+    port: 5432,
+  };
 
 // Primary Database (Write Pool) - Handles all INSERT/UPDATE/DELETE
 const pool = new Pool(poolConfig);
@@ -57,18 +57,17 @@ const pool = new Pool(poolConfig);
 const readPoolConfig = process.env.DATABASE_URL
   ? { connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } }
   : {
-      user: 'orez',
-      host: 'localhost', // e.g., 'replica.postgres.internal'
-      database: 'appdb',
-      password: '123',
-      port: 5432,
-    };
+    user: 'orez',
+    host: 'localhost', // e.g., 'replica.postgres.internal'
+    database: 'appdb',
+    password: '123',
+    port: 5432,
+  };
 
 const readPool = new Pool(readPoolConfig);
 // ----------------------------------------------
 
 // TEMPORARY CLOUD DB INITIALIZATION ROUTE
-const fs = require('fs');
 router.get('/init-cloud-db', async (req, res) => {
   try {
     const schema = fs.readFileSync('./schema.sql', 'utf8');
