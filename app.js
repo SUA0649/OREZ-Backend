@@ -11,7 +11,7 @@ const app = express();
 
 // Middleware
 app.use(compression()); // Compress all HTTP responses (Gzip)
-app.use(cors({ origin: 'http://localhost:3000' })); // Allow frontend
+app.use(cors()); // Allow all origins for Vercel deployment
 app.use(express.json()); // Parse JSON request bodies
 app.use(express.urlencoded({ extended: true })); // Optional: parse URL-encoded bodies
 
@@ -46,7 +46,7 @@ app.use('/api', apiRoutes);
 app.use('/blobs', express.static(path.join(__dirname, 'blobs')));
 
 // Start server
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 Backend running on http://localhost:${PORT}`);
+  console.log(`🚀 Backend running on port ${PORT}`);
 });

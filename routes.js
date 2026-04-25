@@ -26,35 +26,45 @@ const upload = multer({ storage });
 const redis = require('redis');
 
 // Initialize Redis Client
-const redisClient = redis.createClient({
-  socket: {
-    host: 'localhost',
-    port: 6379
-  }
-});
+const redisClient = process.env.REDIS_URL
+  ? redis.createClient({ url: process.env.REDIS_URL })
+  : redis.createClient({
+      socket: {
+        host: 'localhost',
+        port: 6379
+      }
+    });
 
 redisClient.connect().then(() => {
   console.log('✅ Connected to Redis cache');
 }).catch(console.error);
 
+const poolConfig = process.env.DATABASE_URL
+  ? { connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } }
+  : {
+      user: 'orez',
+      host: 'localhost',
+      database: 'appdb',
+      password: '123',
+      port: 5432,
+    };
+
 // Primary Database (Write Pool) - Handles all INSERT/UPDATE/DELETE
-const pool = new Pool({
-  user: 'orez',
-  host: 'localhost',
-  database: 'appdb',
-  password: '123',
-  port: 5432,
-});
+const pool = new Pool(poolConfig);
 
 // Replica Database (Read Pool) - Handles SELECTs (CQRS Architecture)
 // In a true production environment, this points to a separate read-only DB instance.
-const readPool = new Pool({
-  user: 'orez',
-  host: 'localhost', // e.g., 'replica.postgres.internal'
-  database: 'appdb',
-  password: '123',
-  port: 5432,
-});
+const readPoolConfig = process.env.DATABASE_URL
+  ? { connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } }
+  : {
+      user: 'orez',
+      host: 'localhost', // e.g., 'replica.postgres.internal'
+      database: 'appdb',
+      password: '123',
+      port: 5432,
+    };
+
+const readPool = new Pool(readPoolConfig);
 // ----------------------------------------------
 
 
