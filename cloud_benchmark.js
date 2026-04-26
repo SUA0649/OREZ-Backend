@@ -1,32 +1,28 @@
-// backend/api_benchmark.js
-const http = require('http');
+// backend/cloud_benchmark.js
 
-const REPO_ID = 17; // Assuming repo 17 exists based on previous logs
-const API_URL = `http://localhost:3001/api/repos/${REPO_ID}/files`;
-const ITERATIONS = 10000;
+const REPO_ID = 1; // Assuming repo 17 exists based on previous logs
+const API_URL = `https://orez-backend.onrender.com/api/repos/${REPO_ID}/files`;
+const ITERATIONS = 1000; // Reduced iterations to 1000 for cloud stress testing to avoid timeouts
 
-// Helper to make an HTTP request
-const makeRequest = () => {
-  return new Promise((resolve, reject) => {
-    const start = Date.now();
-    http.get(API_URL, (res) => {
-      let data = '';
-      res.on('data', chunk => { data += chunk; });
-      res.on('end', () => {
-        resolve({
-          statusCode: res.statusCode,
-          duration: Date.now() - start
-        });
-      });
-    }).on('error', (err) => {
-      reject(err);
-    });
-  });
+// Helper to make an HTTP/HTTPS request using native fetch
+const makeRequest = async () => {
+  const start = Date.now();
+  try {
+    const res = await fetch(API_URL);
+    // read the full body to ensure the request is actually complete
+    await res.text();
+    return {
+      statusCode: res.status,
+      duration: Date.now() - start
+    };
+  } catch (err) {
+    throw err;
+  }
 };
 
 const runBenchmark = async () => {
   console.log("==================================================");
-  console.log("             OREZ API LOAD TEST              ");
+  console.log("          OREZ CLOUD API LOAD TEST              ");
   console.log("==================================================\n");
 
   console.log("Testing endpoint:", API_URL);
@@ -60,7 +56,7 @@ const runBenchmark = async () => {
     // --------------------------------------------------
     // METRIC 2: Concurrent Spike Test
     // --------------------------------------------------
-    console.log("⚡ METRIC 2: CONCURRENT SPIKE TEST (100 Users)");
+    console.log("⚡ METRIC 2: CONCURRENT SPIKE TEST (1000 Users)");
     console.log("--------------------------------------------------");
 
     const promises = [];
@@ -78,13 +74,12 @@ const runBenchmark = async () => {
     console.log(`- API Throughput: ${((ITERATIONS / concTotalTime) * 1000).toFixed(2)} requests/sec\n`);
 
     console.log("==================================================");
-    console.log("Benchmark run complete.");
+    console.log("            TEST COMPLETED SAFELY                 ");
     console.log("==================================================");
-    console.log("TIP: To see the impact of Redis, comment out the Redis code in routes.js, restart the server, and run this script again!");
 
   } catch (err) {
-    console.error("Benchmark failed:", err.message);
-    console.log("Make sure your Node.js server (npm start) is currently running!");
+    console.error("❌ Cloud Benchmark failed:", err.message);
+    console.log("If you see 'fetch failed' or '502 Bad Gateway', the free tier server might be temporarily overwhelmed!");
   }
 };
 
