@@ -587,11 +587,11 @@ router.get('/repos/:repoId/files', async (req, res) => {
   try {
     // Phase 6: Check Redis Cache First
     const cacheKey = `repo_files_${repoId}`;
-    // const cachedData = await redisClient.get(cacheKey);
-    // if (cachedData) {
-    //   console.log(`[Redis] Cache HIT for repo ${repoId}`);
-    //   return res.json(JSON.parse(cachedData));
-    // }
+    const cachedData = await redisClient.get(cacheKey);
+    if (cachedData) {
+      console.log(`[Redis] Cache HIT for repo ${repoId}`);
+      return res.json(JSON.parse(cachedData));
+    }
 
     console.log(`[Redis] Cache MISS for repo ${repoId}`);
 
